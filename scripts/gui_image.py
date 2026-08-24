@@ -44,7 +44,7 @@ DEFAULT_IMAGE = os.path.join(ROOT, "assets/girl_with_a_pearl_earring.jpg")
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "ladder": [], "note": "", "stamp": 0,
-       "history": []}
+       "history": [], "blocks": {}}
 LOCK = threading.Lock()
 STOP = threading.Event()
 IMAGES = {}                          # downsample factor -> (tensor, target, coords)
@@ -113,6 +113,50 @@ def describe(model, shape):
             "width": w, "height": h}
 
 
+@torch.no_grad()
+def level_maps(model, coords, shape, device, block_px=64):
+    """Where each resolution level does its work.
+
+    Renders the image with levels 0..k enabled for every k and differences
+    consecutive renders, so `deltas[l]` is how much the picture changes when
+    level l is released.  The decoder is nonlinear, so this is the marginal
+    effect of a level given the coarser ones, not a term of a linear
+    decomposition -- but that marginal is exactly what "this level is doing the
+    work here" means.
+
+    Returns a per-pixel effective level (amplitude-weighted mean) and, per
+    block, the level that dominates it, which is what the overlay draws cells
+    for.
+    """
+    enc = model.encoding
+    h, w, c = shape
+    prev, deltas = None, []
+    for k in range(enc.n_levels + 1):
+        enc.set_level_window(float(k))
+        out = render(model, coords, (h, w, c))
+        if prev is not None:
+            deltas.append((out - prev).abs().mean(-1))
+        prev = out
+    enc.set_level_window(float(enc.n_levels))
+    D = torch.stack(deltas)                                   # (L, H, W)
+
+    lev = torch.arange(D.shape[0], device=D.device, dtype=D.dtype)
+    eff = (D * lev[:, None, None]).sum(0) / D.sum(0).clamp(min=1e-9)
+
+    nb = F.avg_pool2d(D[None], block_px, stride=block_px, ceil_mode=True)[0]
+    dom = nb.argmax(0).cpu().numpy()                          # (Hb, Wb)
+    blocks = []
+    for j in range(dom.shape[0]):
+        for i in range(dom.shape[1]):
+            l = int(dom[j, i])
+            blocks.append({"x": i * block_px, "y": j * block_px,
+                           "w": min(block_px, w - i * block_px),
+                           "h": min(block_px, h - j * block_px),
+                           "level": l,
+                           "cell_px": round(w / enc.resolutions[l][0], 2)})
+    return eff.cpu().numpy(), blocks
+
+
 def train_job(p, device):
     try:
         down = max(1, int(p["downsample"]))
@@ -175,6 +219,13 @@ def train_job(p, device):
                     JOB["images"]["error"] = cmap_png(
                         err, max(0.02, float(np.percentile(err, 99))))
                     JOB["stamp"] += 1
+        eff, blocks = level_maps(model, coords, shape, device)
+        with LOCK:
+            JOB["images"]["levels"] = cmap_png(eff, float(eff.max()), "viridis")
+            JOB["blocks"] = {"blocks": blocks, "w": w, "h": h,
+                             "n_levels": len(ladder),
+                             "reference": JOB["images"]["reference"]}
+            JOB["stamp"] += 1
         with LOCK:
             if JOB["curve"]:
                 JOB["history"].append({
@@ -250,6 +301,14 @@ on quality against time and against parameter count.</p>
     <div class="cap">absolute error</div></div>
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
     <div class="cap">psnr against training time &mdash; this run and the last few</div></div>
+</div>
+<div class="row" style="margin-top:18px">
+  <div class="panel"><canvas id="c_levels" width="430" height="510"></canvas>
+    <div class="cap">where the fine levels do the work &mdash; cells drawn at the
+      scale of the level dominating each block</div>
+    <div id="levlegend" class="note"></div></div>
+  <div class="panel"><canvas id="c_effmap" width="330" height="460"></canvas>
+    <div class="cap">effective level per pixel</div></div>
 </div>
 <div class="row" style="margin-top:20px">
   <div class="panel"><div class="label">resolution ladder</div>
@@ -360,6 +419,50 @@ function blit(g,cv,im){
 
 const HCOL=["#4da3ff","#e5a23c","#2ea043","#cf6bd6","#e5484d","#6bd6c9",
             "#9aa4b2","#d6c96b"];
+// viridis-ish ramp: coarse levels dark blue, fine levels yellow
+function levColor(t){
+  const S=[[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]];
+  const x=Math.max(0,Math.min(1,t))*(S.length-1), i=Math.floor(x), f=x-i;
+  const a=S[i], b=S[Math.min(S.length-1,i+1)];
+  return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},`
+        +`${Math.round(a[2]+(b[2]-a[2])*f)})`;
+}
+function drawLevels(bk){
+  const cv=document.getElementById("c_levels"), g=cv.getContext("2d");
+  g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
+  if(!bk || !bk.blocks){ document.getElementById("levlegend").textContent=
+    "run a fit to see the level decomposition"; return; }
+  const im=IMG["c_ref"];
+  const s=Math.min(cv.width/bk.w, cv.height/bk.h);
+  const ox=(cv.width-bk.w*s)/2, oy=(cv.height-bk.h*s)/2;
+  if(im){ g.globalAlpha=0.55; g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
+  const maxl=Math.max(1,bk.n_levels-1);
+  bk.blocks.forEach(b=>{
+    const col=levColor(b.level/maxl);
+    // Cells finer than ~3 screen px would be a solid wash: tint the block
+    // instead, so "too fine to draw" still reads as "very fine".
+    const cw=b.cell_px*s;
+    g.strokeStyle=col; g.lineWidth=0.6; g.globalAlpha=0.85;
+    if(cw < 3){
+      g.fillStyle=col; g.globalAlpha=0.30;
+      g.fillRect(ox+b.x*s, oy+b.y*s, b.w*s, b.h*s); g.globalAlpha=0.85;
+    } else {
+      for(let x=0;x<=b.w;x+=b.cell_px){ g.beginPath();
+        g.moveTo(ox+(b.x+x)*s, oy+b.y*s); g.lineTo(ox+(b.x+x)*s, oy+(b.y+b.h)*s);
+        g.stroke(); }
+      for(let y=0;y<=b.h;y+=b.cell_px){ g.beginPath();
+        g.moveTo(ox+b.x*s, oy+(b.y+y)*s); g.lineTo(ox+(b.x+b.w)*s, oy+(b.y+y)*s);
+        g.stroke(); }
+    }
+    g.globalAlpha=1;
+  });
+  const used=[...new Set(bk.blocks.map(b=>b.level))].sort((a,b)=>a-b);
+  document.getElementById("levlegend").innerHTML =
+    "dominant level per 64 px block &nbsp; " + used.map(l=>{
+      const b=bk.blocks.find(q=>q.level===l);
+      return `<span style="color:${levColor(l/maxl)}">&#9632; ${l} `
+            +`(${b.cell_px} px cells)</span>`; }).join(" &nbsp; ");
+}
 function drawCurve(cur, hist){
   const cv=document.getElementById("c_curve"), g=cv.getContext("2d");
   const W=cv.width, H=cv.height;
@@ -411,7 +514,8 @@ async function poll(){
   if(r.stamp!==LAST){
     LAST=r.stamp;
     drawImg("c_ref", r.images.reference); drawImg("c_fit", r.images.fit);
-    drawImg("c_err", r.images.error);
+    drawImg("c_err", r.images.error);   drawImg("c_effmap", r.images.levels);
+    drawLevels(r.blocks);
     drawCurve(r.curve, r.history); drawLadder(r.ladder, r.metrics);
     drawHistory(r.history);
     const m=r.metrics||{};
