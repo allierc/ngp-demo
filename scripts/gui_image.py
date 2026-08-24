@@ -114,7 +114,7 @@ def describe(model, shape):
 
 
 @torch.no_grad()
-def level_maps(model, coords, shape, device, block_px=64):
+def level_maps(model, shape, device, block_px=64, sub=3):
     """Where each resolution level does its work.
 
     Renders the image with levels 0..k enabled for every k and differences
@@ -127,13 +127,21 @@ def level_maps(model, coords, shape, device, block_px=64):
     Returns a per-pixel effective level (amplitude-weighted mean) and, per
     block, the level that dominates it, which is what the overlay draws cells
     for.
+
+    Evaluated on a grid `sub` times coarser than the image: this costs L+1 full
+    renders, and at full resolution that is far more than the fit itself, which
+    would make the panel affordable only once at the end.  Block statistics do
+    not need the pixels.  Everything returned is still in image pixel units.
     """
     enc = model.encoding
     h, w, c = shape
+    hs, ws = max(8, h // sub), max(8, w // sub)
+    coords = pixel_centers(hs, ws, device)
+    bs = max(2, block_px // sub)
     prev, deltas = None, []
     for k in range(enc.n_levels + 1):
         enc.set_level_window(float(k))
-        out = render(model, coords, (h, w, c))
+        out = render(model, coords, (hs, ws, c))
         if prev is not None:
             deltas.append((out - prev).abs().mean(-1))
         prev = out
@@ -143,7 +151,7 @@ def level_maps(model, coords, shape, device, block_px=64):
     lev = torch.arange(D.shape[0], device=D.device, dtype=D.dtype)
     eff = (D * lev[:, None, None]).sum(0) / D.sum(0).clamp(min=1e-9)
 
-    nb = F.avg_pool2d(D[None], block_px, stride=block_px, ceil_mode=True)[0]
+    nb = F.avg_pool2d(D[None], bs, stride=bs, ceil_mode=True)[0]
     dom = nb.argmax(0).cpu().numpy()                          # (Hb, Wb)
     blocks = []
     for j in range(dom.shape[0]):
@@ -219,13 +227,12 @@ def train_job(p, device):
                     JOB["images"]["error"] = cmap_png(
                         err, max(0.02, float(np.percentile(err, 99))))
                     JOB["stamp"] += 1
-        eff, blocks = level_maps(model, coords, shape, device)
-        with LOCK:
-            JOB["images"]["levels"] = cmap_png(eff, float(eff.max()), "viridis")
-            JOB["blocks"] = {"blocks": blocks, "w": w, "h": h,
-                             "n_levels": len(ladder),
-                             "reference": JOB["images"]["reference"]}
-            JOB["stamp"] += 1
+                eff, blocks = level_maps(model, shape, device)
+                with LOCK:
+                    JOB["images"]["levels"] = cmap_png(eff, float(eff.max()), "viridis")
+                    JOB["blocks"] = {"blocks": blocks, "w": w, "h": h,
+                                     "n_levels": len(ladder)}
+                    JOB["stamp"] += 1
         with LOCK:
             if JOB["curve"]:
                 JOB["history"].append({
@@ -299,14 +306,13 @@ on quality against time and against parameter count.</p>
     <div class="cap">fit</div></div>
   <div class="panel"><canvas id="c_err" width="330" height="460"></canvas>
     <div class="cap">absolute error</div></div>
+  <div class="panel"><canvas id="c_levels" width="330" height="460"></canvas>
+    <div class="cap">cells at the scale of the level dominating each block</div></div>
+</div>
+<div id="levlegend" class="note"></div>
+<div class="row" style="margin-top:18px">
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
     <div class="cap">psnr against training time &mdash; this run and the last few</div></div>
-</div>
-<div class="row" style="margin-top:18px">
-  <div class="panel"><canvas id="c_levels" width="430" height="510"></canvas>
-    <div class="cap">where the fine levels do the work &mdash; cells drawn at the
-      scale of the level dominating each block</div>
-    <div id="levlegend" class="note"></div></div>
   <div class="panel"><canvas id="c_effmap" width="330" height="460"></canvas>
     <div class="cap">effective level per pixel</div></div>
 </div>
