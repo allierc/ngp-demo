@@ -183,8 +183,8 @@ def train_one(model, source, target, fg_idx, shape, cfg, device, loss_kind="l2",
             torch.cuda.synchronize()
         t_train += time.perf_counter() - t0
         if step % max(1, steps // 10) == 0 or step == steps:
-            hist.append({"step": step, "train_s": t_train, "photometric_mse": photo})
-            log(f"    step {step:5d}  {t_train:6.1f}s  photometric mse {photo:.3e}")
+            hist.append({"step": step, "train_s": t_train, "loss": photo})
+            log(f"    step {step:5d}  {t_train:6.1f}s  loss {photo:.3e}")
     peak = (torch.cuda.max_memory_allocated(device) / 2**20) if device.type == "cuda" else 0.0
     return hist, t_train, peak
 

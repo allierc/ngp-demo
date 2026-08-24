@@ -82,6 +82,26 @@ models:
     inherits: ngp
     coarse_to_fine:
       enabled: false
+  - name: ngp_hashed
+    inherits: ngp
+    encoding:
+      n_levels: 12
+      n_features_per_level: 2
+      log2_hashmap_size: 16
+      base_resolution: 8
+      per_level_scale: 1.5
+      max_resolution: 512
+      interpolation: smoothstep
+  - name: ngp_matched
+    inherits: ngp
+    encoding:
+      n_levels: 8
+      n_features_per_level: 2
+      log2_hashmap_size: 16
+      base_resolution: 8
+      per_level_scale: 1.5
+      max_resolution: 128
+      interpolation: smoothstep
   - name: tensor_16
     kind: control_grid
     grid: [16, 16]
