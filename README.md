@@ -115,6 +115,77 @@ Three things to read off that table.
    without fixing it. First derivatives (12–13% relative error) are usable; second
    derivatives through a hash grid need explicit smoothing or supervision.
 
+## Stage 4 — registration: a hash grid against a control grid
+
+`config/registration_benchmark.yaml` warps the painting by a known analytic field
+to make a target, then asks each parameterisation to recover it. Because `u_gt` is
+analytic, every run is scored on the **field** it recovered, split three ways:
+the textured foreground, the black background where nothing constrains the warp,
+and the 24 px band between them. 35 runs; `scripts/summarise.py` merges them.
+
+```bash
+python scripts/run_registration.py            # the grid
+python scripts/summarise.py                   # merge + figure
+python scripts/gui.py                         # or drive it in a browser
+```
+
+Matched-intensity arm, endpoint error in pixels (foreground / band / background):
+
+| deformation | ngp | tensor_16 | tensor_256 |
+|---|---|---|---|
+| global_smooth | **0.108** / 1.51 / 12.53 | 0.408 / **0.97** / **12.29** | 0.157 / 4.95 / 13.36 |
+| local_bending | **0.062** / **0.20** / 0.42 | 0.538 / 0.32 / **0.20** | 0.072 / 1.22 / 4.10 |
+| global_plus_local | **0.162** / 1.56 / 12.57 | 0.736 / **1.06** / **12.27** | 0.409 / 4.98 / 13.32 |
+| slip_band | **0.324** / **0.82** / **3.60** | 1.693 / 3.61 / 5.17 | 0.424 / 7.51 / 16.78 |
+
+* **Where there is texture the hash grid wins**, by 3.8-5.2x over a 16x16 control
+  grid on every deformation -- including the shear band, where a C^0 encoding
+  represents a near-discontinuity that a bilinear control grid structurally cannot.
+* **Where there is no data the coarse grid wins.** `tensor_16` is better in the
+  band and background on the smooth warps. Its structural smoothness *is* the
+  prior, and in an unconstrained region the prior is the entire answer.
+* **`tensor_256` is the worst of both**: competitive in the foreground, 4.9-13.0 px
+  in the band. Capacity without locality extrapolates badly exactly at the mask edge.
+
+### Resolve to the data, again -- and it is the Jacobian that pays
+
+| local_bending / matched | params | EPE fg | EPE bg | bending energy |
+|---|---|---|---|---|
+| finest 512 cells (1.8 px) | 2,356,738 | 0.062 | 0.422 | 2.07e-03 |
+| finest 512, hashed at 2^16 | 552,834 | 0.063 | 0.813 | 2.12e-03 |
+| **finest 128 cells (7.1 px)** | **69,428** | **0.053** | **0.402** | **3.24e-05** |
+
+34x fewer parameters, slightly better accuracy, and a **64x lower bending energy**.
+The deformation's finest feature is ~30 px, so every level below ~7 px/cell was
+inventing structure no sample constrains. As in stages 1-3 it costs almost nothing
+in the loss and everything in the derivative.
+
+### Coarse-to-fine and an image pyramid are substitutes
+
+| global_plus_local / matched | EPE fg | min det J |
+|---|---|---|
+| pyramid, level window on | 0.162 | 0.336 |
+| pyramid, level window off | **0.111** | 0.330 |
+| no pyramid, level window on | **0.115** | 0.206 |
+| no pyramid, level window off | **4.950** | **-4.831** |
+
+Either mechanism supplies the coarse-to-fine an intensity loss needs; without
+both, the fit lands 43x worse and folds. Running both is mildly counterproductive,
+since the level window only delays access to the fine levels. The level window is
+the cheaper of the two -- no blurred copies of the volume.
+
+Two bugs this stage caught, both of which would have produced confident wrong
+conclusions, are worth naming because they are easy to repeat:
+
+1. A single absolute regulariser weight against two data terms of very different
+   magnitude (L2 ~1e-4, 1-LNCC ~3e-1) leaves the cross-modal arm effectively
+   unregularised. It looked like "modality mismatch causes folding" (10-23% folded
+   Jacobians against 0%); it was a missing weight.
+2. Ground-truth displacements of 12-42 px against a 9 px LNCC window give a
+   capture radius of ~4 px, so neither model could converge. That looked like a
+   model comparison; it was the objective. An image pyramid took the hash grid
+   from 11.59 to 1.27 px endpoint error and the control grid from 8.68 to 1.47.
+
 ## What this encoder does that tiny-cuda-nn's does not
 
 * Runs anywhere torch runs — no `nvcc`, no build. It is slower than the fused CUDA

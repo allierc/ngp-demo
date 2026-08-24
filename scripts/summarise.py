@@ -43,7 +43,8 @@ def get_args():
     p.add_argument("--dirs", nargs="*", default=[
         os.path.join(ROOT, "out/registration"),
         os.path.join(ROOT, "out/registration_c2f"),
-        os.path.join(ROOT, "out/registration_enc")])
+        os.path.join(ROOT, "out/registration_enc"),
+        os.path.join(ROOT, "out/registration_c2f_nopyr")])
     p.add_argument("--out", default=os.path.join(ROOT, "out/registration_summary"))
     return p.parse_args()
 
@@ -60,7 +61,11 @@ def main():
         with open(f) as fh:
             got = json.load(fh)
         for r in got:
-            key = (r["deformation"], r["mismatch"], r["model"])
+            # The pyramid belongs in the key: a no-pyramid run is a different
+            # configuration, not a correction of the same one, and keying
+            # without it made the two silently overwrite each other.
+            key = (r["deformation"], r["mismatch"], r["model"],
+                   r.get("pyramid", True))
             if key in rows:
                 print(f"  superseded by {os.path.basename(d)}: {key}")
             rows[key] = r
@@ -69,7 +74,8 @@ def main():
         sys.exit("no results found -- run scripts/run_registration.py first")
 
     ordered = sorted(rows.values(),
-                     key=lambda r: (r["deformation"], r["mismatch"], r["model"]))
+                     key=lambda r: (r["deformation"], r["mismatch"],
+                                    not r.get("pyramid", True), r["model"]))
     lines = ["# Registration benchmark", "",
              f"{len(ordered)} runs. EPE = endpoint error against the analytic field, "
              "in pixels: `fg` is the textured foreground, `bg` the zeroed background "
@@ -77,10 +83,13 @@ def main():
              "them. In the background every model predicts nearly zero displacement, "
              "so EPE there mostly reports how much ground-truth warp exists in a "
              "region no data can reach.", ""]
-    for key in dict.fromkeys((r["deformation"], r["mismatch"]) for r in ordered):
-        sel = [r for r in ordered if (r["deformation"], r["mismatch"]) == key]
+    for key in dict.fromkeys((r["deformation"], r["mismatch"],
+                              r.get("pyramid", True)) for r in ordered):
+        sel = [r for r in ordered
+               if (r["deformation"], r["mismatch"], r.get("pyramid", True)) == key]
         loss = sel[0].get("loss", "l2")
-        lines += [f"### {key[0]} / {key[1]}  ({loss} loss)", "",
+        pyr = "" if key[2] else ", no image pyramid"
+        lines += [f"### {key[0]} / {key[1]}  ({loss} loss{pyr})", "",
                   "| " + " | ".join(c[1] for c in COLS) + " |",
                   "|" + "---|" * len(COLS)]
         for r in sel:
@@ -99,7 +108,8 @@ def main():
 
 def figure(rows, out):
     """Endpoint error by region, one panel per (deformation, mismatch)."""
-    keys = list(dict.fromkeys((r["deformation"], r["mismatch"]) for r in rows))
+    keys = list(dict.fromkeys((r["deformation"], r["mismatch"],
+                               r.get("pyramid", True)) for r in rows))
     models = list(dict.fromkeys(r["model"] for r in rows))
     ncol = min(4, len(keys))
     nrow = int(np.ceil(len(keys) / ncol))
@@ -109,7 +119,8 @@ def figure(rows, out):
                ("endpoint_error_px_background", "background", "tab:orange")]
     for i, key in enumerate(keys):
         a = ax[i // ncol][i % ncol]
-        sel = {r["model"]: r for r in rows if (r["deformation"], r["mismatch"]) == key}
+        sel = {r["model"]: r for r in rows
+               if (r["deformation"], r["mismatch"], r.get("pyramid", True)) == key}
         present = [m for m in models if m in sel]
         x = np.arange(len(present))
         for j, (field, lab, col) in enumerate(regions):
@@ -123,7 +134,8 @@ def figure(rows, out):
         a.grid(alpha=0.25, axis="y")
         a.text(0.02, 0.98, "abcdefghijkl"[i], transform=a.transAxes, va="top",
                ha="left", fontsize=15, fontweight="bold")
-        a.text(0.98, 0.98, f"{key[0]}\n{key[1]}", transform=a.transAxes,
+        a.text(0.98, 0.98, f"{key[0]}\n{key[1]}" + ("" if key[2] else "\nno pyramid"),
+               transform=a.transAxes,
                va="top", ha="right", fontsize=10, color="0.35")
     for i in range(len(keys), nrow * ncol):
         ax[i // ncol][i % ncol].axis("off")

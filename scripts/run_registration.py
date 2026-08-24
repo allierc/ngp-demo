@@ -367,8 +367,10 @@ def main():
                 m, warped, epe, u = evaluate(model, u_gt, source, target_clean,
                                              target_obs, masks, shape, device)
                 n_a, n_b = model.n_parameters()
+                pyr_sig = cfg["training"].get("image_pyramid", {}).get("sigma_px", [0])
                 m.update({"deformation": dname, "mismatch": xname, "model": mname,
                           "loss": loss_kind,
+                          "pyramid": bool(max(pyr_sig) > 0),
                           "w_smooth": _weight(cfg["training"]["loss"]["smoothness"]["weight"],
                                               loss_kind),
                           "w_fold": _weight(cfg["training"]["loss"]["folding"]["weight"],
