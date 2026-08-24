@@ -1,0 +1,6 @@
+torch>=2.0
+numpy
+pillow
+matplotlib
+imageio
+imageio-ffmpeg
