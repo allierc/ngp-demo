@@ -375,6 +375,11 @@ function group(name, opts, key){
     b.setAttribute("aria-pressed", sel[key]===o);
     b.onclick=()=>{ sel[key]=o;
       [...s.children].forEach(c=>c.setAttribute("aria-pressed", c===b));
+      // The L2 data term sits near 1e-4 and 1-LNCC near 3e-1, so the same
+      // absolute regulariser weight is ~1000x weaker under LNCC. Follow the
+      // loss when the mismatch changes instead of leaving a stale weight.
+      if(key==="mismatch"){ const r=SPEC.reg[SPEC.loss[o]];
+        knob.w_smooth=r.w_smooth; knob.w_fold=r.w_fold; }
       buildKnobs(); };
     s.appendChild(b);
   });
@@ -574,9 +579,16 @@ class Handler(BaseHTTPRequestHandler):
             resolved = resolve_inherits(cfg["models"])
             models = [m["name"] for m in resolved]
             kinds = {m["name"]: m["kind"] for m in resolved}
+            sm = cfg["training"]["loss"]["smoothness"]["weight"]
+            fo = cfg["training"]["loss"]["folding"]["weight"]
             spec = {"deformation": [d["name"] for d in cfg["deformations"]],
                     "mismatch": [m["name"] for m in cfg["modality_mismatch"]],
-                    "model": models, "kind": kinds}
+                    "model": models, "kind": kinds,
+                    "loss": {m["name"]: m.get("loss", "l2")
+                             for m in cfg["modality_mismatch"]},
+                    "reg": {k: {"w_smooth": sm[k] if isinstance(sm, dict) else sm,
+                                "w_fold": fo[k] if isinstance(fo, dict) else fo}
+                            for k in ("l2", "lncc")}}
             page = (PAGE.replace("__SPEC__", json.dumps(spec))
                         .replace("__KNOBS__", json.dumps(KNOB_SPEC))
                         .replace("__DEF__", json.dumps(KNOB_DEFAULTS)))

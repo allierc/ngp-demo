@@ -120,6 +120,10 @@ def sample_points(fg_idx, n, frac, shape, device):
     return torch.cat([xy_fg, xy_u], dim=0)
 
 
+def _weight(w, loss_kind):
+    return float(w[loss_kind]) if isinstance(w, dict) else float(w)
+
+
 def train_one(model, source, target, fg_idx, shape, cfg, device, loss_kind="l2",
               log=print):
     tr = cfg["training"]
@@ -134,8 +138,11 @@ def train_one(model, source, target, fg_idx, shape, cfg, device, loss_kind="l2",
     reg_n = tr.get("reg_batch", 8192)
     offs = patch_offsets(tr["loss"]["lncc"]["window_px"], shape, device)
     n_p = tr["loss"]["lncc"]["n_patches"]
-    w_smooth = tr["loss"]["smoothness"]["weight"]
-    w_fold = tr["loss"]["folding"]["weight"]
+    # Weights are per loss kind: the L2 data term sits near 1e-4 while 1-LNCC
+    # sits near 3e-1, so a single absolute weight makes the regulariser ~1000x
+    # weaker in the cross-modal arm and folding gets blamed on the mismatch.
+    w_smooth = _weight(tr["loss"]["smoothness"]["weight"], loss_kind)
+    w_fold = _weight(tr["loss"]["folding"]["weight"], loss_kind)
 
     torch.cuda.reset_peak_memory_stats(device) if device.type == "cuda" else None
     hist, t_train = [], 0.0
@@ -346,7 +353,11 @@ def main():
                                              target_obs, masks, shape, device)
                 n_a, n_b = model.n_parameters()
                 m.update({"deformation": dname, "mismatch": xname, "model": mname,
-                          "loss": loss_kind, "n_parameters": n_a + n_b,
+                          "loss": loss_kind,
+                          "w_smooth": _weight(cfg["training"]["loss"]["smoothness"]["weight"],
+                                              loss_kind),
+                          "w_fold": _weight(cfg["training"]["loss"]["folding"]["weight"],
+                                            loss_kind), "n_parameters": n_a + n_b,
                           "train_seconds": secs, "peak_gpu_mb": peak})
                 rows.append(m)
                 tag = f"{dname}__{xname}__{mname}"

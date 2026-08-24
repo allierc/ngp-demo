@@ -133,12 +133,16 @@ training:
       n_patches: 1024
     smoothness:
       kind: gradient_l2
-      weight: 1.0e-3
       source: autograd
+      weight:
+        l2: 1.0e-3
+        lncc: 1.0
     folding:
       kind: hinge_negative_jacobian
-      weight: 1.0e-2
       source: autograd
+      weight:
+        l2: 1.0e-2
+        lncc: 1.0e+1
 
 metrics:
   photometric:
