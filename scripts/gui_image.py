@@ -41,6 +41,14 @@ from ngp.webui import CSS, cmap_png, gray_png
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_IMAGE = os.path.join(ROOT, "assets/girl_with_a_pearl_earring.jpg")
+# Level colours come from a fixed 0..20 scale rather than from each run's own
+# range, so a colour means the same level whatever L is set to and two runs can
+# be compared by eye.
+LEVEL_LUT_MAX = 20
+# The error panel is on a fixed scale too: auto-scaling to each refresh's own
+# 99th percentile made the panel brighten as the fit improved, which reads as
+# the opposite of what happened.
+ERROR_LUT_MAX = 0.10
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "ladder": [], "note": "", "stamp": 0,
@@ -224,12 +232,11 @@ def train_job(p, device):
                                          "loss": float(loss)})
                     JOB["metrics"] = {**info, "psnr": db, "loss": float(loss)}
                     JOB["images"]["fit"] = gray_png(fit)
-                    JOB["images"]["error"] = cmap_png(
-                        err, max(0.02, float(np.percentile(err, 99))))
+                    JOB["images"]["error"] = cmap_png(err, ERROR_LUT_MAX)
                     JOB["stamp"] += 1
                 eff, blocks = level_maps(model, shape, device)
                 with LOCK:
-                    JOB["images"]["levels"] = cmap_png(eff, float(eff.max()), "viridis")
+                    JOB["images"]["levels"] = cmap_png(eff, LEVEL_LUT_MAX, "viridis")
                     JOB["blocks"] = {"blocks": blocks, "w": w, "h": h,
                                      "n_levels": len(ladder)}
                     JOB["stamp"] += 1
@@ -299,13 +306,13 @@ on quality against time and against parameter count.</p>
 </div></div>
 <div class="bar"><i id="prog"></i></div>
 <div class="note" id="note"></div>
-<div class="row" style="margin-top:18px">
+<div class="row equal" style="margin-top:18px">
   <div class="panel"><canvas id="c_ref" width="330" height="460"></canvas>
     <div class="cap">reference</div></div>
   <div class="panel"><canvas id="c_fit" width="330" height="460"></canvas>
     <div class="cap">fit</div></div>
   <div class="panel"><canvas id="c_err" width="330" height="460"></canvas>
-    <div class="cap">absolute error</div></div>
+    <div class="cap">absolute error &mdash; fixed scale 0&ndash;__ERRMAX__</div></div>
   <div class="panel"><canvas id="c_levels" width="330" height="460"></canvas>
     <div class="cap">cells at the scale of the level dominating each block</div></div>
 </div>
@@ -314,7 +321,7 @@ on quality against time and against parameter count.</p>
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
     <div class="cap">psnr against training time &mdash; this run and the last few</div></div>
   <div class="panel"><canvas id="c_effmap" width="330" height="460"></canvas>
-    <div class="cap">effective level per pixel</div></div>
+    <div class="cap">effective level per pixel &mdash; same 0&ndash;20 scale</div></div>
 </div>
 <div class="row" style="margin-top:20px">
   <div class="panel"><div class="label">resolution ladder</div>
@@ -324,7 +331,7 @@ on quality against time and against parameter count.</p>
 </div>
 <div class="stats" id="stats"></div>
 </div><script>
-const KNOBS=__KNOBS__, TRAIN=__TRAIN__, DEF=__DEF__;
+const KNOBS=__KNOBS__, TRAIN=__TRAIN__, DEF=__DEF__, LUTMAX=__LUTMAX__;
 const knob=Object.assign({}, DEF);
 let LAST=-1, POLL=null, IMG={};
 
@@ -442,7 +449,7 @@ function drawLevels(bk){
   const s=Math.min(cv.width/bk.w, cv.height/bk.h);
   const ox=(cv.width-bk.w*s)/2, oy=(cv.height-bk.h*s)/2;
   if(im){ g.globalAlpha=0.55; g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
-  const maxl=Math.max(1,bk.n_levels-1);
+  const maxl=LUTMAX;
   bk.blocks.forEach(b=>{
     const col=levColor(b.level/maxl);
     // Cells finer than ~3 screen px would be a solid wash: tint the block
@@ -453,21 +460,35 @@ function drawLevels(bk){
       g.fillStyle=col; g.globalAlpha=0.30;
       g.fillRect(ox+b.x*s, oy+b.y*s, b.w*s, b.h*s); g.globalAlpha=0.85;
     } else {
-      for(let x=0;x<=b.w;x+=b.cell_px){ g.beginPath();
-        g.moveTo(ox+(b.x+x)*s, oy+b.y*s); g.lineTo(ox+(b.x+x)*s, oy+(b.y+b.h)*s);
-        g.stroke(); }
-      for(let y=0;y<=b.h;y+=b.cell_px){ g.beginPath();
-        g.moveTo(ox+b.x*s, oy+(b.y+y)*s); g.lineTo(ox+(b.x+b.w)*s, oy+(b.y+y)*s);
-        g.stroke(); }
+      // Step along the GLOBAL cell lattice and clip to the block. Starting each
+      // block at its own origin makes the last cell of one block and the first
+      // of the next share a boundary that is not a cell boundary, and the grid
+      // reads as unevenly spaced.
+      const c=b.cell_px;
+      for(let x=Math.ceil(b.x/c)*c; x<=b.x+b.w; x+=c){ g.beginPath();
+        g.moveTo(ox+x*s, oy+b.y*s); g.lineTo(ox+x*s, oy+(b.y+b.h)*s); g.stroke(); }
+      for(let y=Math.ceil(b.y/c)*c; y<=b.y+b.h; y+=c){ g.beginPath();
+        g.moveTo(ox+b.x*s, oy+y*s); g.lineTo(ox+(b.x+b.w)*s, oy+y*s); g.stroke(); }
     }
     g.globalAlpha=1;
   });
   const used=[...new Set(bk.blocks.map(b=>b.level))].sort((a,b)=>a-b);
+  let bar="";
+  for(let i=0;i<=LUTMAX;i++)
+    bar+=`<span style="display:inline-block;width:16px;height:10px;`
+        +`background:${levColor(i/LUTMAX)}"></span>`;
+  let ticks="";
+  for(let i=0;i<=LUTMAX;i+=5)
+    ticks+=`<span style="display:inline-block;width:80px">${i}</span>`;
   document.getElementById("levlegend").innerHTML =
-    "dominant level per 64 px block &nbsp; " + used.map(l=>{
-      const b=bk.blocks.find(q=>q.level===l);
-      return `<span style="color:${levColor(l/maxl)}">&#9632; ${l} `
-            +`(${b.cell_px} px cells)</span>`; }).join(" &nbsp; ");
+    `<div style="margin-bottom:2px">level colour scale, fixed 0&ndash;${LUTMAX}`
+    +` &nbsp; (applies to the grid and to the effective-level map)</div>`
+    +`<div style="line-height:0">${bar}</div><div>${ticks}</div>`
+    +`<div style="margin-top:5px">dominant level per 64 px block in this fit: `
+    + used.map(l=>{
+        const b=bk.blocks.find(q=>q.level===l);
+        return `<span style="color:${levColor(l/LUTMAX)}">&#9632; ${l} `
+              +`(${b.cell_px} px cells)</span>`; }).join(" &nbsp; ") + "</div>";
 }
 function drawCurve(cur, hist){
   const cv=document.getElementById("c_curve"), g=cv.getContext("2d");
@@ -562,7 +583,9 @@ class Handler(BaseHTTPRequestHandler):
             page = (PAGE.replace("__CSS__", CSS)
                         .replace("__KNOBS__", json.dumps(KNOBS))
                         .replace("__TRAIN__", json.dumps(TRAIN_KNOBS))
-                        .replace("__DEF__", json.dumps(DEFAULTS)))
+                        .replace("__DEF__", json.dumps(DEFAULTS))
+                        .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
+                        .replace("__ERRMAX__", f"{ERROR_LUT_MAX:g}"))
             return self._send(page, "text/html; charset=utf-8")
         if u.path == "/api/preview":
             p = _params(q)

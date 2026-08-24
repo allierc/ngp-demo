@@ -86,6 +86,12 @@ CSS = """
   .row { display:flex; gap:18px; align-items:flex-start; flex-wrap:wrap; }
   .panel { display:flex; flex-direction:column; gap:8px; }
   canvas { display:block; background:var(--bg); border:1px solid #333; }
+  /* A row of equal panels that must not wrap: the canvases keep their pixel
+     backing store and are scaled by CSS, so four of them share the width
+     evenly however narrow the window is. */
+  .row.equal { flex-wrap:nowrap; }
+  .row.equal .panel { flex:1 1 0; min-width:0; }
+  .row.equal canvas { width:100%; height:auto; }
   .cap { font-size:10px; letter-spacing:.14em; text-transform:uppercase;
          color:var(--dim); }
   .cap i { color:var(--red); font-style:normal; }
