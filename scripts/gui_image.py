@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ngp import NGPField
 from ngp.utils import BilinearImage, pixel_centers, psnr, read_image, render
-from ngp.webui import CSS, cmap_png, gray_png
+from ngp.webui import ABOUT_HTML, CSS, cmap_png, gray_png
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_IMAGE = os.path.join(ROOT, "assets/girl_with_a_pearl_earring.jpg")
@@ -117,6 +117,7 @@ def describe(model, shape):
             "n_values": h * w * c,
             "fraction_of_values": (n_enc + n_mlp) / (h * w * c),
             "hashed_levels": sum(1 for d in enc.dense if not d),
+            "n_levels": enc.n_levels, "channels": c,
             "finest_px_per_cell": w / enc.resolutions[-1][0],
             "width": w, "height": h}
 
@@ -256,17 +257,27 @@ def train_job(p, device):
             JOB["stamp"] += 1
 
 
+# Defaults chosen for this page's own default resolution (downsample 2): L15,
+# b 1.35 and a 2^17 table land on ~52% of the image's RGB values with no two
+# levels sharing a lattice and the finest level exactly at the pixel spacing.
+# The same encoder against the full-resolution image would read ~4x smaller,
+# which is why fit_image.py's defaults differ.
+# Defaults chosen for this page's own default resolution (downsample 2): L15,
+# b 1.35 and a 2^17 table land on ~52% of the image's RGB values, with no two
+# levels sharing a lattice and the finest level exactly at the pixel spacing.
+# The same encoder against the full-resolution image reads ~4x smaller, which
+# is why fit_image.py's defaults differ.
 KNOBS = [
-    {"name": "n_levels", "label": "levels L", "min": 2, "max": 20, "default": 16,
+    {"name": "n_levels", "label": "levels L", "min": 2, "max": 20, "default": 15,
      "step": 1},
     {"name": "n_features", "label": "features per level F", "min": 1, "max": 8,
      "default": 2, "step": 1},
     {"name": "log2_hashmap_size", "label": "log2 table size T", "min": 10,
-     "max": 24, "default": 19, "step": 1},
+     "max": 24, "default": 17, "step": 1},
     {"name": "base_resolution", "label": "coarsest cells per axis", "min": 2,
      "max": 64, "default": 16, "step": 1},
     {"name": "per_level_scale", "label": "growth per level b", "min": 1.1,
-     "max": 2.0, "default": 1.4, "step": 0.05},
+     "max": 2.0, "default": 1.35, "step": 0.05},
     {"name": "max_resolution", "label": "finest cells per axis (0 = the pixel count)",
      "min": 0, "max": 4096, "default": 0, "step": 32},
     {"name": "n_neurons", "label": "decoder width", "min": 16, "max": 256,
@@ -297,6 +308,9 @@ one pixel the encoder is resolving structure no sample constrains &mdash; it cos
 parameters, barely moves PSNR, and turns up later as noise in every derivative
 taken through the fit. Finished runs stay on the curve, so settings can be compared
 on quality against time and against parameter count.</p>
+<div class="controls"><div class="group"><div class="label">&nbsp;</div>
+  <div class="seg"><button onclick="openAbout()">what is an ngp?</button></div>
+</div></div>
 <div class="controls" id="controls"></div>
 <div class="knobs" id="knobs_enc"></div>
 <div class="knobs" id="knobs_train"></div>
@@ -316,6 +330,7 @@ on quality against time and against parameter count.</p>
   <div class="panel"><canvas id="c_levels" width="330" height="460"></canvas>
     <div class="cap">cells at the scale of the level dominating each block</div></div>
 </div>
+<div id="zoomnote" class="note"></div>
 <div id="levlegend" class="note"></div>
 <div class="row" style="margin-top:18px">
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
@@ -330,10 +345,29 @@ on quality against time and against parameter count.</p>
     <div id="history"></div></div>
 </div>
 <div class="stats" id="stats"></div>
+<div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
+  <div class="sheet">__ABOUT__</div></div>
 </div><script>
+function openAbout(){document.getElementById("about").classList.add("open");}
+function closeAbout(){document.getElementById("about").classList.remove("open");}
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
 const KNOBS=__KNOBS__, TRAIN=__TRAIN__, DEF=__DEF__, LUTMAX=__LUTMAX__;
 const knob=Object.assign({}, DEF);
 let LAST=-1, POLL=null, IMG={};
+// White line, with the compression figure carrying the verdict: green under
+// 50% of the image's own values, amber under 100%, red once the "compression"
+// is an expansion.
+function noteHTML(m){
+  if(!m || m.n_total===undefined) return "";
+  const f=m.fraction_of_values*100;
+  const col = f<50 ? "#2ea043" : (f<100 ? "#e5a23c" : "#e5484d");
+  return `<span style="color:#fff">${m.width}&times;${m.height}&times;${m.channels}, `
+       + `${m.n_total.toLocaleString()} parameters `
+       + `(<b style="color:${col}">${f.toFixed(1)}%</b> of the `
+       + `${m.n_values.toLocaleString()} reference values), `
+       + `${m.hashed_levels}/${m.n_levels} levels hashed, `
+       + `${m.finest_px_per_cell.toFixed(2)} px per finest cell</span>`;
+}
 
 const C=document.getElementById("controls");
 function seg(name, opts, key, after){
@@ -390,7 +424,7 @@ async function preview(){
     const r=await (await fetch("/api/preview?"+new URLSearchParams(knob))).json();
     if(r.error) return;
     drawLadder(r.ladder, r.info);
-    if(!JOBRUNNING) document.getElementById("note").textContent=r.note;
+    if(!JOBRUNNING) document.getElementById("note").innerHTML=noteHTML(r.info);
   }, 120);
 }
 let JOBRUNNING=false;
@@ -417,6 +451,53 @@ document.getElementById("run").onclick=async()=>{
 document.getElementById("stop").onclick=()=>fetch("/api/stop");
 document.getElementById("clear").onclick=async()=>{ await fetch("/api/clear"); poll(); };
 
+// One shared view for every panel: hovering any of them magnifies all of them
+// about the same point, so the fit, the error and the level grid can be read
+// against each other at the same place rather than eyeballed across panels.
+const ZOOM={on:false, u:0.5, v:0.5, f:4};
+function view(cv, iw, ih){
+  const s0=Math.min(cv.width/iw, cv.height/ih);
+  // The reference panel is the navigator and never zooms: it keeps the whole
+  // picture so the magnified region has somewhere to be located.
+  if(!ZOOM.on || cv.id==="c_ref")
+    return {s:s0, ox:(cv.width-iw*s0)/2, oy:(cv.height-ih*s0)/2, s0};
+  const s=s0*ZOOM.f;
+  return {s, ox:cv.width/2-ZOOM.u*iw*s, oy:cv.height/2-ZOOM.v*ih*s, s0};
+}
+const PANELS=["c_ref","c_fit","c_err","c_levels"];
+function redrawAll(){
+  PANELS.forEach(id=>{ if(id==="c_levels") drawLevels(LASTBLOCKS);
+                       else if(IMG[id]) blit(document.getElementById(id).getContext("2d"),
+                                             document.getElementById(id), IMG[id]); });
+  if(IMG["c_effmap"]) blit(document.getElementById("c_effmap").getContext("2d"),
+                           document.getElementById("c_effmap"), IMG["c_effmap"]);
+}
+// Only the reference panel drives the magnifier.
+["c_ref"].forEach(id=>{
+  const cv=document.getElementById(id);
+  cv.addEventListener("mousemove", e=>{
+    const r=cv.getBoundingClientRect();
+    // The canvas is CSS-scaled, so screen pixels are not backing-store pixels.
+    const cx=(e.clientX-r.left)/r.width*cv.width, cy=(e.clientY-r.top)/r.height*cv.height;
+    const im=IMG[id] || IMG["c_ref"]; if(!im) return;
+    const v=view(cv, im.width, im.height);
+    ZOOM.u=Math.min(1,Math.max(0,(cx-v.ox)/(im.width*v.s)));
+    ZOOM.v=Math.min(1,Math.max(0,(cy-v.oy)/(im.height*v.s)));
+    ZOOM.on=true; redrawAll(); zoomNote();
+  });
+  cv.addEventListener("mouseleave", ()=>{ ZOOM.on=false; redrawAll(); zoomNote(); });
+  cv.addEventListener("wheel", e=>{
+    e.preventDefault();
+    ZOOM.f=Math.min(32, Math.max(1, ZOOM.f*(e.deltaY<0?1.25:0.8)));
+    if(ZOOM.f<=1.02){ ZOOM.on=false; } redrawAll(); zoomNote();
+  }, {passive:false});
+});
+function zoomNote(){
+  document.getElementById("zoomnote").textContent = ZOOM.on
+    ? `magnifier ${ZOOM.f.toFixed(1)}x at (${(ZOOM.u*100).toFixed(0)}%, `
+      +`${(ZOOM.v*100).toFixed(0)}%) — scroll to change, move off a panel to reset`
+    : "hover any panel to magnify all of them at the same point; scroll to zoom";
+}
 function drawImg(id, src){
   const cv=document.getElementById(id), g=cv.getContext("2d");
   if(!src){ g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height); return; }
@@ -425,9 +506,18 @@ function drawImg(id, src){
 }
 function blit(g,cv,im){
   g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
-  const s=Math.min(cv.width/im.width, cv.height/im.height);
-  g.drawImage(im,(cv.width-im.width*s)/2,(cv.height-im.height*s)/2,
-              im.width*s, im.height*s);
+  const v=view(cv, im.width, im.height);
+  g.imageSmoothingEnabled = !ZOOM.on || cv.id==="c_ref";   // show pixels when magnified
+  g.drawImage(im, v.ox, v.oy, im.width*v.s, im.height*v.s);
+  if(cv.id==="c_ref" && ZOOM.on) drawViewport(g, cv, im.width, im.height, v);
+}
+// The rectangle the other panels are currently showing, drawn on the navigator.
+function drawViewport(g, cv, iw, ih, v){
+  const z=document.getElementById("c_fit");
+  const wImg=z.width/(v.s0*ZOOM.f), hImg=z.height/(v.s0*ZOOM.f);
+  const x=v.ox+(ZOOM.u*iw-wImg/2)*v.s, y=v.oy+(ZOOM.v*ih-hImg/2)*v.s;
+  g.strokeStyle="#e5484d"; g.lineWidth=1.4;
+  g.strokeRect(x, y, wImg*v.s, hImg*v.s);
 }
 
 const HCOL=["#4da3ff","#e5a23c","#2ea043","#cf6bd6","#e5484d","#6bd6c9",
@@ -440,15 +530,17 @@ function levColor(t){
   return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},`
         +`${Math.round(a[2]+(b[2]-a[2])*f)})`;
 }
+let LASTBLOCKS=null;
 function drawLevels(bk){
+  bk = bk || LASTBLOCKS; LASTBLOCKS = bk;
   const cv=document.getElementById("c_levels"), g=cv.getContext("2d");
   g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
   if(!bk || !bk.blocks){ document.getElementById("levlegend").textContent=
     "run a fit to see the level decomposition"; return; }
   const im=IMG["c_ref"];
-  const s=Math.min(cv.width/bk.w, cv.height/bk.h);
-  const ox=(cv.width-bk.w*s)/2, oy=(cv.height-bk.h*s)/2;
-  if(im){ g.globalAlpha=0.55; g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
+  const v=view(cv, bk.w, bk.h); const s=v.s, ox=v.ox, oy=v.oy;
+  if(im){ g.globalAlpha=0.55; g.imageSmoothingEnabled=!ZOOM.on;
+          g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
   const maxl=LUTMAX;
   bk.blocks.forEach(b=>{
     const col=levColor(b.level/maxl);
@@ -537,7 +629,9 @@ async function poll(){
   JOBRUNNING=r.running;
   document.getElementById("prog").style.width=
     (r.steps ? (r.step/r.steps*100) : 0)+"%";
-  if(r.note) document.getElementById("note").textContent=r.note;
+  if(r.metrics && r.metrics.n_total!==undefined)
+    document.getElementById("note").innerHTML=noteHTML(r.metrics);
+  else if(r.note) document.getElementById("note").textContent=r.note;
   if(r.stamp!==LAST){
     LAST=r.stamp;
     drawImg("c_ref", r.images.reference); drawImg("c_fit", r.images.fit);
@@ -557,7 +651,7 @@ async function poll(){
   }
   if(!r.running && POLL){ clearInterval(POLL); POLL=null; }
 }
-preview(); poll();
+zoomNote(); preview(); poll();
 </script></body></html>
 """
 
@@ -581,6 +675,7 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path in ("/", "/index.html"):
             page = (PAGE.replace("__CSS__", CSS)
+                        .replace("__ABOUT__", ABOUT_HTML)
                         .replace("__KNOBS__", json.dumps(KNOBS))
                         .replace("__TRAIN__", json.dumps(TRAIN_KNOBS))
                         .replace("__DEF__", json.dumps(DEFAULTS))

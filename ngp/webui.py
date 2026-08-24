@@ -110,4 +110,115 @@ CSS = """
                     text-transform:uppercase; }
   table.ladder td { text-align:right; padding:2px 10px; color:#d8d8d8; }
   table.ladder tr.hashed td { color:var(--amber); }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.85); display:none;
+           z-index:50; overflow:auto; }
+  .modal.open { display:block; }
+  .modal .sheet { max-width:820px; margin:6vh auto; background:#000;
+                  border:1px solid var(--fg); padding:28px 30px 34px; }
+  .modal h2 { font-size:13px; letter-spacing:.14em; text-transform:uppercase;
+              margin:22px 0 8px; font-weight:600; }
+  .modal h2:first-of-type { margin-top:0; }
+  .modal p { font-size:13px; line-height:1.6; color:#d0d0d0; margin:0 0 10px; }
+  .modal code { color:var(--amber); font-family:ui-monospace,Menlo,monospace;
+                font-size:12px; }
+  .modal a { color:var(--blue); }
+  .modal .close { float:right; background:#000; color:var(--fg);
+                  border:1px solid var(--fg); padding:5px 12px; cursor:pointer;
+                  font:inherit; font-size:12px; }
+  .modal ul { margin:0 0 10px; padding-left:20px; color:#d0d0d0; font-size:13px;
+              line-height:1.6; }
+"""
+
+# One explainer, shared by both pages: what the encoding is, what each control
+# changes, and which claims here were measured rather than assumed.
+ABOUT_HTML = """
+<button class="close" onclick="closeAbout()">close</button>
+<h2>The idea</h2>
+<p>Muller, Evans, Schied and Keller, <i>Instant Neural Graphics Primitives with a
+Multiresolution Hash Encoding</i>, SIGGRAPH 2022
+(<a href="https://arxiv.org/abs/2201.05989" target="_blank">arXiv:2201.05989</a>,
+<a href="https://github.com/NVlabs/instant-ngp" target="_blank">NVlabs/instant-ngp</a>).</p>
+<p>A coordinate goes in; a colour, a density or a displacement comes out. Rather
+than ask one large network to carry every scale, the coordinate is first
+<i>encoded</i>: <code>L</code> grids are laid over the domain at geometrically
+growing resolutions <code>N_l = N_min * b^l</code>, each node carries <code>F</code>
+learnable numbers, and a query interpolates the <code>2^D</code> corners of its cell
+at every level. The levels are concatenated into an <code>L*F</code> vector that a
+small MLP decodes. Both the table and the network are trained by ordinary
+gradients.</p>
+
+<h2>The hash table is the entire data structure</h2>
+<p>Each level owns one flat array of <code>T = 2^log2_hashmap_size</code> feature
+vectors. Nothing else exists: no tree, no nodes, no pointers, no traversal, no
+refinement bookkeeping. A lookup is an index computation and a gather, O(1),
+identical for every level and every point.</p>
+<p>When a level's grid fits inside its table it is indexed <b>directly</b> and there
+are no collisions at all -- the coarse levels of any sane configuration are plain
+dense grids. When it does not fit, node coordinates are folded through a spatial
+hash,</p>
+<p><code>h(x) = ( XOR_d  x_d * pi_d )  mod  T</code>, &nbsp; pi = (1, 2654435761,
+805459861, 3674653429)</p>
+<p>and distinct nodes start <i>sharing</i> entries. This is the step that decouples
+cost from resolution: a 512-cell-per-axis level in 3D has ~10^8 nodes, which nobody
+stores, but its table is still <code>T</code> entries. Refining a level costs
+nothing extra. In this page the ladder marks which levels are dense and which are
+hashed -- move <code>log2 table size T</code> and watch the boundary move.</p>
+
+<h2>Why collisions are the mechanism, not a defect</h2>
+<p>Two far-apart fine nodes sharing an entry receive the <i>sum</i> of their
+gradients. Where one of them sits in empty or unconstrained space it contributes
+almost nothing, so the entry is won, automatically, by whichever node the data
+actually constrains. No importance heuristic decides this and no pass detects it:
+the optimiser does it as a side effect of training. The failure case is honest and
+worth knowing -- two <i>equally</i> well-constrained distant regions colliding do
+fight over one entry.</p>
+
+<h2>The hierarchy is built for free</h2>
+<p>This is the part worth dwelling on. An adaptive octree or quadtree has to be
+<i>constructed</i>: decide where to subdivide, maintain the topology as the fit
+changes, keep gradients consistent across a structure that is itself moving, and
+serialise all of it. A hash encoding skips the entire problem. Every level is
+evaluated at every query point, always. There is no decision about where to refine,
+so there is nothing to build, nothing to update mid-training, and nothing that
+serialises a GPU.</p>
+<p>Adaptivity still happens -- it just falls out of the gradients rather than out of
+bookkeeping. Entries only move where samples touch them; entries whose region
+carries no signal keep their initialisation. The result is a fit that spends its
+fine levels exactly where the data has detail, with no mechanism anywhere in the
+code that aimed for that. The panel on this page showing cells drawn at the scale
+of the level dominating each block is that effect, measured: on the painting, the
+dark surround is carried by a level with ~33 px cells while the face and turban are
+carried by one with ~3 px cells.</p>
+<p>Free of <i>structure</i>, not free of memory: every level is allocated whether or
+not it earns its keep. What is avoided is the <code>O(N^D)</code> growth of the fine
+levels, and that is the whole game in 3D.</p>
+
+<h2>The controls</h2>
+<ul>
+<li><code>levels L</code>, <code>growth b</code> -- the ladder of scales. The
+coarsest should span the domain; the finest should stop at the spacing of your
+data. Two levels landing on the same lattice are wasted: they are separate feature
+sets on identical nodes, which <code>F</code> buys more directly.</li>
+<li><code>features per level F</code> -- width per scale; doubling it doubles the
+table.</li>
+<li><code>log2 table size T</code> -- where collisions begin.</li>
+<li><code>finest cells per axis</code> -- the misleading one. Refining past the
+pixel spacing barely moves PSNR while costing parameters, and the structure it
+invents below the sampling scale is invisible in the image and fatal in any
+derivative taken through the fit.</li>
+<li><code>interpolation</code> -- linear is the paper's default and only C0.
+Smoothstep replaces the weight w by 3w^2-2w^3, making the encoding C1, which is
+required for second derivatives.</li>
+</ul>
+
+<h2>Measured here, not assumed</h2>
+<ul>
+<li>Autograd through this pure-PyTorch encoder matches float64 finite differences
+to 5.6e-10 median relative error.</li>
+<li>With linear interpolation the Laplacian of a fit scores relative L2 of 1.011
+against analytic truth -- exactly what predicting zero scores.</li>
+<li>Capping the finest level at the image's pixel count gave <i>both</i> fewer
+parameters and higher PSNR than leaving it uncapped: 5.92M / 40.28 dB against
+7.66M / 39.54 dB.</li>
+</ul>
 """

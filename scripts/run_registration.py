@@ -45,6 +45,9 @@ def get_args():
     p.add_argument("--models", nargs="*", default=None)
     p.add_argument("--mismatch", nargs="*", default=None)
     p.add_argument("--steps", type=int, default=None, help="override config")
+    p.add_argument("--no-pyramid", action="store_true",
+                   help="disable the image blur schedule, to test what the "
+                        "encoder's own level window is worth on its own")
     p.add_argument("--out", default=None)
     p.add_argument("--device", default=None)
     return p.parse_args()
@@ -301,6 +304,8 @@ def main():
         cfg = yaml.safe_load(f)
     if args.steps:
         cfg["training"]["steps"] = args.steps
+    if args.no_pyramid:
+        cfg["training"]["image_pyramid"] = {"sigma_px": [0], "switch_at": [0.0]}
     out_root = args.out or os.path.join(ROOT, cfg["runs"]["out"])
     os.makedirs(out_root, exist_ok=True)
     device = torch.device(args.device or cfg.get("device", "cuda"))

@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ngp.deform import (apply_mismatch, build_deformation, build_model, field_jacobian,
                         lncc_loss, patch_offsets, pixel_grid, sample_bilinear, warp_image)
 from ngp.utils import psnr
+from ngp.webui import ABOUT_HTML
 from scripts.run_registration import (_dense_field, _feather, foreground_mask, load_image,
                                       resolve_inherits, sample_points)
 
@@ -332,6 +333,9 @@ images line up. Endpoint error is split into the textured foreground, the black
 background where nothing constrains the warp, and the band between &mdash; that split
 is where the two parameterisations disagree, long after the warped image stops
 telling them apart.</p>
+<div class="controls"><div class="group"><div class="label">&nbsp;</div>
+  <div class="seg"><button onclick="openAbout()">what is an ngp?</button></div>
+</div></div>
 <div class="controls" id="controls"></div>
 <div class="knobs" id="knobs_model"></div>
 <div class="knobs" id="knobs_train"></div>
@@ -357,7 +361,12 @@ telling them apart.</p>
     <div class="cap">loss and endpoint error against iteration</div></div>
 </div>
 <div class="stats" id="stats"></div>
+<div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
+  <div class="sheet">__ABOUT__</div></div>
 </div><script>
+function openAbout(){document.getElementById("about").classList.add("open");}
+function closeAbout(){document.getElementById("about").classList.remove("open");}
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
 const SPEC=__SPEC__, KNOBS=__KNOBS__, DEF=__DEF__;
 const sel={deformation:SPEC.deformation[0], mismatch:SPEC.mismatch[0],
            model:SPEC.model[0]};
@@ -589,7 +598,8 @@ class Handler(BaseHTTPRequestHandler):
                     "reg": {k: {"w_smooth": sm[k] if isinstance(sm, dict) else sm,
                                 "w_fold": fo[k] if isinstance(fo, dict) else fo}
                             for k in ("l2", "lncc")}}
-            page = (PAGE.replace("__SPEC__", json.dumps(spec))
+            page = (PAGE.replace("__ABOUT__", ABOUT_HTML)
+                        .replace("__SPEC__", json.dumps(spec))
                         .replace("__KNOBS__", json.dumps(KNOB_SPEC))
                         .replace("__DEF__", json.dumps(KNOB_DEFAULTS)))
             return self._send(page, "text/html; charset=utf-8")
