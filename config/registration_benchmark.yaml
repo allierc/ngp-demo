@@ -7,9 +7,12 @@ image:
   channels: gray
   downsample: 2
   foreground:
-    threshold: 0.06
+    threshold: 0.14
     blur_px: 3
+    open_px: 6
     dilate_px: 12
+    zero_background: true
+    feather_px: 9
 
 warp:
   convention: target(x) = source(x + u(x))
@@ -38,6 +41,22 @@ deformations:
     width_px: 12
     offset_px: 18
     placement: foreground
+
+modality_mismatch:
+  - name: matched
+    loss: l2
+  - name: gamma
+    gamma: 0.55
+    intensity_scale: 0.80
+    intensity_offset: 0.02
+    loss: lncc
+  - name: gamma_noise
+    gamma: 0.55
+    intensity_scale: 0.80
+    intensity_offset: 0.02
+    poisson_gain: 60.0
+    read_noise_sigma: 0.010
+    loss: lncc
 
 models:
   - name: ngp
@@ -87,10 +106,11 @@ training:
   sampling:
     foreground_fraction: 0.9
     jitter: subpixel
+  reg_batch: 8192
   loss:
-    photometric:
-      kind: l2
-      normalize: none
+    lncc:
+      window_px: 9
+      n_patches: 1024
     smoothness:
       kind: gradient_l2
       weight: 1.0e-3
@@ -102,8 +122,8 @@ training:
 
 metrics:
   photometric:
-    - psnr_warped_vs_target
-    - ncc_warped_vs_target
+    - psnr_warped_vs_clean_target
+    - ncc_warped_vs_observed_target
   field:
     - endpoint_error_px_mean
     - endpoint_error_px_p95
@@ -116,7 +136,7 @@ metrics:
     - bending_energy
   cost:
     - n_parameters
-    - seconds_to_target_psnr
+    - seconds_to_within_1db_of_final
     - peak_gpu_mb
   evaluation:
     resolution: full
@@ -126,7 +146,6 @@ metrics:
 visualization:
   warped_grid_overlay:
     spacing_px: 32
-    on: [ground_truth, ngp, tensor_16]
   level_hierarchy:
     levels: [0, 4, 8, 11, 13]
     draw_cells_on_image: true
@@ -138,6 +157,6 @@ visualization:
   dpi: 130
 
 runs:
-  cross: [deformations, models]
+  cross: [deformations, modality_mismatch, models]
   repeats: 1
   out: out/registration

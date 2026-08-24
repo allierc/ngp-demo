@@ -142,6 +142,19 @@ class MultiResHashGrid(nn.Module):
         self.register_buffer("_smooth_mask",
                              torch.tensor([[i == "smoothstep" for i in interp]]),
                              persistent=False)
+        # Coarse-to-fine window (BARF/Nerfies): per-level gains, all on by default.
+        self.register_buffer("level_gain", torch.ones(n_levels), persistent=False)
+
+    def set_level_window(self, alpha: float) -> None:
+        """Enable levels up to `alpha`, with the fractional level faded in.
+
+        alpha = 4.0 gives levels 0-3 at full weight and everything above off;
+        alpha = 4.5 fades level 4 in at half.  Registration needs this: releasing
+        the fine levels only once the coarse ones have converged is what keeps an
+        intensity loss out of its nearest local minimum.
+        """
+        l = torch.arange(self.n_levels, dtype=torch.float32, device=self.level_gain.device)
+        self.level_gain.copy_((alpha - l).clamp(0.0, 1.0))
 
     def extra_repr(self) -> str:
         n_hash = sum(1 for d in self.dense if not d)
@@ -199,7 +212,10 @@ class MultiResHashGrid(nn.Module):
                 wc = term if wc is None else wc * term
 
             f = self.table[idx + off]                                # (B, C, F)
-            feats.append((wc.unsqueeze(-1) * f).sum(dim=1))          # (B, F)
+            out_l = (wc.unsqueeze(-1) * f).sum(dim=1)                # (B, F)
+            if self.level_gain[lvl] != 1.0:
+                out_l = out_l * self.level_gain[lvl]
+            feats.append(out_l)
 
         return torch.cat(feats, dim=-1).reshape(*lead, self.n_output_dims)
 
