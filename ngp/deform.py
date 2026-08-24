@@ -94,6 +94,44 @@ def apply_mismatch(image: torch.Tensor, spec: dict, seed: int = 0) -> torch.Tens
     return out
 
 
+def gaussian_blur(image: torch.Tensor, sigma_px: float) -> torch.Tensor:
+    """Separable Gaussian blur of a (H, W) image; sigma 0 returns it unchanged."""
+    if sigma_px <= 0:
+        return image
+    r = max(1, int(round(3 * sigma_px)))
+    k = torch.arange(-r, r + 1, device=image.device, dtype=image.dtype)
+    k = torch.exp(-(k**2) / (2 * sigma_px**2))
+    k = k / k.sum()
+    x = image[None, None]
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
+    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1))
+    return x[0, 0]
+
+
+def build_pyramid(image: torch.Tensor, sigmas) -> list:
+    """One blurred copy of `image` per sigma, coarsest first."""
+    return [gaussian_blur(image, float(s)) for s in sigmas]
+
+
+def pyramid_level(step: int, steps: int, switch_at) -> int:
+    """Which pyramid level a given step is on.
+
+    Registration by intensity is a local search: a patch correlation carries no
+    gradient once the misalignment exceeds about half its window, and an L2 term
+    none once it exceeds the width of the image feature it sits on.  Blurring
+    both images widens those features, so the capture range at the coarsest
+    level is set by sigma rather than by the texture.  Without this, a 9 px LNCC
+    window cannot recover a 24 px displacement no matter which model is fitting
+    it -- the failure is in the objective, not the parameterisation.
+    """
+    f = step / max(1, steps)
+    lvl = 0
+    for i, a in enumerate(switch_at):
+        if f >= a:
+            lvl = i
+    return lvl
+
+
 def patch_offsets(window_px: int, shape, device) -> torch.Tensor:
     """(P*P, 2) offsets of a window_px square patch, in normalised units."""
     h, w = shape

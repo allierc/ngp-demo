@@ -29,8 +29,9 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ngp.deform import (apply_mismatch, build_deformation, build_model, field_jacobian,
-                        lncc_loss, patch_offsets, pixel_grid, sample_bilinear, warp_image)
+from ngp.deform import (apply_mismatch, build_deformation, build_model, build_pyramid,
+                        field_jacobian, lncc_loss, patch_offsets, pixel_grid,
+                        pyramid_level, sample_bilinear, warp_image)
 from ngp.utils import psnr, read_image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -144,8 +145,13 @@ def train_one(model, source, target, fg_idx, shape, cfg, device, loss_kind="l2",
     w_smooth = _weight(tr["loss"]["smoothness"]["weight"], loss_kind)
     w_fold = _weight(tr["loss"]["folding"]["weight"], loss_kind)
 
+    pyr = tr.get("image_pyramid", {"sigma_px": [0], "switch_at": [0.0]})
+    src_p = build_pyramid(source, pyr["sigma_px"])
+    tgt_p = build_pyramid(target, pyr["sigma_px"])
+
     torch.cuda.reset_peak_memory_stats(device) if device.type == "cuda" else None
     hist, t_train = [], 0.0
+    lvl = -1
     for step in range(steps + 1):
         t0 = time.perf_counter()
         if kind == "hash_grid" and c2f.get("enabled"):
@@ -162,9 +168,13 @@ def train_one(model, source, target, fg_idx, shape, cfg, device, loss_kind="l2",
         else:
             xy = sample_points(fg_idx, tr["batch"], tr["sampling"]["foreground_fraction"],
                                shape, device)
+        new_lvl = pyramid_level(step, steps, pyr["switch_at"])
+        if new_lvl != lvl:
+            lvl = new_lvl
+            log(f"    pyramid sigma {pyr['sigma_px'][lvl]} px at step {step}")
         u = model(xy)
-        pred = sample_bilinear(source, xy + u / px)
-        gt = sample_bilinear(target, xy)
+        pred = sample_bilinear(src_p[lvl], xy + u / px)
+        gt = sample_bilinear(tgt_p[lvl], xy)
         loss = (lncc_loss(pred, gt, n_p) if loss_kind == "lncc"
                 else ((pred - gt) ** 2).mean())
         photo = loss.item()

@@ -127,6 +127,9 @@ training:
     foreground_fraction: 0.9
     jitter: subpixel
   reg_batch: 8192
+  image_pyramid:
+    sigma_px: [16, 8, 4, 2, 0]
+    switch_at: [0.0, 0.15, 0.30, 0.45, 0.60]
   loss:
     lncc:
       window_px: 9
