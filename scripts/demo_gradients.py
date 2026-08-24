@@ -247,8 +247,10 @@ def field_figure(results, out):
     tags = iter("abcdefghij")
     for i, row in enumerate(rows):
         lim = float(np.percentile(np.abs(truth[row]), 99))
+        short = {"smoothstep/smoothstep/linear": "smoothstep xy, linear t"}
         cols = [(truth[row], "analytic")] + [
-            (m[row], f"{s['interpolation']}") for m, _, s in results]
+            (m[row], short.get(s["interpolation"], s["interpolation"]))
+            for m, _, s in results]
         for j, (img, note) in enumerate(cols):
             a = ax[i, j]
             im = a.imshow(img, cmap="RdBu_r", vmin=-lim, vmax=lim, origin="lower")
