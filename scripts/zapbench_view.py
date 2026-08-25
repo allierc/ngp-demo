@@ -122,7 +122,16 @@ move the slider to travel through the run.</p>
 <div class="stats" id="stats"></div>
 </div><script>
 let PTS=null, VAL=null, N=0, T=1, ROT={x:-0.35,y:0.6}, ZOOM=1.25, DRAG=null;
-let MODE="mag", FRAME=0, VMAX=1, BUSY=false;
+let MODE="mag", FRAME=0, VMAX=1, BUSY=false, SCALE=16, PLAY=false;
+// Advances by a stride so the whole run plays in a few hundred steps, and awaits
+// each frame rather than firing on a timer, so it self-throttles to the network.
+async function run(){
+  while(PLAY){
+    const stride=Math.max(1, Math.round(T/300));
+    FRAME=(FRAME+stride)%T; rng.value=FRAME; val.textContent=FRAME;
+    await loadFrame(FRAME);
+  }
+}
 
 const cv=document.getElementById("view"), g=cv.getContext("2d");
 const img=g.createImageData(cv.width, cv.height);
@@ -140,8 +149,11 @@ function seg(name, opts, cur, cb){
     s.appendChild(b); });
   gp.append(l,s); C.appendChild(gp);
 }
-seg("colour by", [["|u|","mag"],["x","0"],["y","1"],["z","2"]], "mag",
+seg("colour by", [["|u|","mag"],["c0","0"],["c1","1"],["c2","2"]], "mag",
     v=>{ MODE=v; loadFrame(FRAME); });
+seg("scale (voxels)", [["8",8],["16",16],["32",32],["64",64]], 16,
+    v=>{ SCALE=v; loadFrame(FRAME); });
+seg("", [["play",1],["pause",0]], 0, v=>{ PLAY=!!v; if(PLAY) run(); });
 
 const K=document.getElementById("knobs");
 K.innerHTML='<div class="title">time</div>';
@@ -212,15 +224,24 @@ function draw(){
 async function loadFrame(t){
   if(BUSY) return; BUSY=true;
   FRAME=t;
-  const r=await (await fetch(`/api/frame?t=${t}&mode=${MODE}`)).json();
+  const r=await (await fetch(`/api/frame?t=${t}&mode=${MODE}&vmax=${SCALE}`)).json();
   VAL=new Uint8Array(atob(r.val).split("").map(c=>c.charCodeAt(0)));
   VMAX=r.vmax;
+  let bar="";
+  for(let i=0;i<=20;i++){
+    const c = MODE==="mag" ? ramp(i/20) : diverge(i/10-1);
+    bar+=`<span style="display:inline-block;width:13px;height:9px;`
+        +`background:rgb(${c[0]|0},${c[1]|0},${c[2]|0})"></span>`;
+  }
+  const ends = MODE==="mag" ? `0 &rarr; ${SCALE} voxels`
+                            : `&minus;${SCALE} &rarr; +${SCALE} voxels`;
   document.getElementById("stats").innerHTML=
     `frame <b>${t}</b> of ${T-1} &nbsp;&middot;&nbsp; `
-    +(MODE==="mag" ? `|u| up to <b>${r.vmax.toFixed(1)}</b> voxels, mean `
-                     +`<b>${r.mean.toFixed(2)}</b>`
-                   : `component ${MODE} in <b>&plusmn;${r.vmax.toFixed(1)}</b> voxels, `
-                     +`mean <b>${r.mean.toFixed(2)}</b>`);
+    +`mean <b>${r.mean.toFixed(2)}</b> vox, largest <b>${r.data_max.toFixed(1)}</b>`
+    +(r.clipped>0 ? ` &nbsp;&middot;&nbsp; <span class="bad">`
+                    +`${(r.clipped*100).toFixed(1)}% beyond the scale</span>` : "")
+    +`<br><span style="line-height:0">${bar}</span> `
+    +`<span style="color:var(--dim)"> ${ends} (fixed)</span>`;
   BUSY=false; draw();
 }
 
@@ -275,17 +296,23 @@ class Handler(BaseHTTPRequestHandler):
             t = int(float(q.get("t", 0)))
             mode = q.get("mode", "mag")
             a, mag = frame(t)
+            # A FIXED scale by default. Rescaling to each frame's own percentile
+            # makes a drifting field look static: the colours stay put while the
+            # displacement grows underneath them.
+            fixed = q.get("vmax")
             if mode == "mag":
-                vmax = float(np.percentile(mag, 99)) or 1.0
+                d = mag
+                vmax = float(fixed) if fixed else float(np.percentile(mag, 99)) or 1.0
                 val = np.clip(mag / vmax, 0, 1)
-                mean = float(mag.mean())
             else:
-                c = a[int(mode)]
-                vmax = float(np.percentile(np.abs(c), 99)) or 1.0
-                val = np.clip(c / vmax, -1, 1) * 0.5 + 0.5
-                mean = float(c.mean())
+                d = a[int(mode)]
+                vmax = float(fixed) if fixed else float(np.percentile(np.abs(d), 99)) or 1.0
+                val = np.clip(d / vmax, -1, 1) * 0.5 + 0.5
+            over = float((np.abs(d) > vmax).mean())
             return self._send(json.dumps({"val": b64((val * 255).astype(np.uint8)),
-                                          "vmax": vmax, "mean": mean}),
+                                          "vmax": vmax, "mean": float(d.mean()),
+                                          "data_max": float(np.abs(d).max()),
+                                          "clipped": over}),
                               "application/json")
         self.send_error(404)
 
