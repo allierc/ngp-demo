@@ -5,7 +5,7 @@
     python scripts/zapbench_modes.py --stride 20     # denser in time, slower
     python scripts/zapbench_modes.py --consecutive   # the aliasing control
 
-Needs `tensorstore` and a network; nothing else in this repo does.
+Needs `tensorstore` (in the env specs) and a network; nothing else here does.
 
 The question is whether a dense 4D displacement field carries dense information.
 It does not: inside the cells, across all 7,879 frames, two spatial modes and

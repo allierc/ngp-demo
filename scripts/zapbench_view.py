@@ -4,10 +4,8 @@
     python scripts/zapbench_view.py            # http://localhost:8023
     python scripts/zapbench_view.py --stride 2 # every 2nd masked voxel, lighter
 
-Reads `gs://zapbench-release` anonymously, so it needs `tensorstore` and a
-network, and neither is required by the rest of this repo:
-
-    pip install tensorstore
+Reads `gs://zapbench-release` anonymously, so it needs `tensorstore` (in the
+env specs) and a network, and neither is required by the rest of this repo.
 
 The flow field is 3 x 36 x 83 x 128 x 7879 and the segmentation is
 2048 x 1328 x 72 -- exactly 16 x 16 x 2 the flow grid -- so a block-max over the

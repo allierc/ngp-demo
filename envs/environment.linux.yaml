@@ -31,3 +31,8 @@ dependencies:
       # imageio writes mp4 through this; without the PACKAGE (not merely ffmpeg
       # on PATH) the writer degrades silently and emits a TIFF with an .mp4 name
       - imageio-ffmpeg==0.5.1
+      # zapbench only: scripts/zapbench_view.py and zapbench_modes.py read
+      # gs://zapbench-release through it. 0.1.65 is the version the flow-field
+      # numbers in the README were measured with. Nothing else imports it, so
+      # dropping this line still gives a working environment for every stage.
+      - tensorstore==0.1.65

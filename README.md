@@ -67,7 +67,6 @@ Outputs (images, mp4s, figures, `report.json`) land in `out/`.
 ## An application: the zapbench flow field
 
 ```bash
-pip install tensorstore                  # only this script needs it
 python scripts/zapbench_view.py          # http://localhost:8023
 ```
 
@@ -104,9 +103,11 @@ python tests/test_ngp.py                            # 9 passed
 ```
 
 The specs pin only what the repo imports: torch, numpy, pillow, matplotlib,
-imageio and pyyaml, plus `imageio-ffmpeg`. That last one is the *Python package*
-and not the ffmpeg binary — `imageio`'s mp4 writer falls back silently without
-it and produces a TIFF carrying an `.mp4` name.
+imageio and pyyaml, plus `imageio-ffmpeg` and `tensorstore`. `imageio-ffmpeg` is
+the *Python package* and not the ffmpeg binary — `imageio`'s mp4 writer falls
+back silently without it and produces a TIFF carrying an `.mp4` name.
+`tensorstore` is only read by the two zapbench scripts; drop that line and every
+stage still runs, minus the `gs://zapbench-release` reads.
 
 The Linux spec takes torch 2.9.0 from the CUDA 12.8 wheel index, which is the
 build every number in this README was measured on. The macOS spec takes torch
@@ -120,7 +121,7 @@ other tests do not need it.
 If you would rather not use conda:
 
 ```bash
-pip install torch numpy pillow matplotlib imageio imageio-ffmpeg pyyaml
+pip install torch numpy pillow matplotlib imageio imageio-ffmpeg pyyaml tensorstore
 ```
 
 ## Stage 1 — an image
