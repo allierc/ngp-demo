@@ -28,8 +28,35 @@ python scripts/demo_gradients.py                              # stage 3
 python tests/test_ngp.py                                      # 9 passed
 ```
 
-Needs `torch`, `numpy`, `pillow`, `matplotlib`, `imageio`, `imageio-ffmpeg`.
 Outputs (images, mp4s, figures, `report.json`) land in `out/`.
+
+## Install
+
+```bash
+conda env create -f envs/environment.linux.yaml     # or environment.mac.yaml
+conda activate ngp-demo
+python tests/test_ngp.py                            # 9 passed
+```
+
+The specs pin only what the repo imports: torch, numpy, pillow, matplotlib,
+imageio and pyyaml, plus `imageio-ffmpeg`. That last one is the *Python package*
+and not the ffmpeg binary — `imageio`'s mp4 writer falls back silently without
+it and produces a TIFF carrying an `.mp4` name.
+
+The Linux spec takes torch 2.9.0 from the CUDA 12.8 wheel index, which is the
+build every number in this README was measured on. The macOS spec takes torch
+from conda and has no CUDA: the demos run on `mps` or the CPU, so expect the
+timings to be slower rather than comparable.
+
+`tests/check_pages.py` additionally needs `node` on PATH; it loads each browser
+page's script against a stub DOM, which is not something Python can check. The
+other tests do not need it.
+
+If you would rather not use conda:
+
+```bash
+pip install torch numpy pillow matplotlib imageio imageio-ffmpeg pyyaml
+```
 
 ## Stage 1 — an image
 
