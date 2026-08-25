@@ -104,12 +104,14 @@ def train_job(cfg, p, device):
                 f"{gt.total():.0f} {unit} in total = {gt.speed:.4g} {unit}/frame, "
                 f"band width {gt.width:.0f} px; "
                 f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells in space, "
-                f"{enc.resolutions[-1][2]} in time; {n_enc + n_mlp:,} parameters")
+                f"{enc.resolutions[-1][2]} in time; {n_enc + n_mlp:,} parameters, "
+                f"{n_enc:,} of them in the hash table")
         picks = [0, n_frames // 2, n_frames - 1]
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
                        curve=[], per_frame=[], note=note, frames=picks,
                        metrics={"n_parameters": n_enc + n_mlp,
+                                "n_table": n_enc, "n_decoder": n_mlp,
                                 "n_levels_total": enc.n_levels,
                                 "total_motion": gt.total(), "unit": unit},
                        images={f"target{i}": gray_png(
@@ -117,6 +119,9 @@ def train_job(cfg, p, device):
                            for i, t in enumerate(picks)},
                        stamp=JOB["stamp"] + 1)
         print(f"[run] {note}", flush=True)
+        print(f"[params] {n_enc + n_mlp:,} total = {n_enc:,} in the hash table "
+              f"({enc.table.shape[0]:,} entries x {enc.table.shape[1]} features) "
+              f"+ {n_mlp:,} in the decoder", flush=True)
 
         opt = torch.optim.Adam(model.parameters(), lr=float(p["lr"]))
         steps = int(p["steps"])
@@ -617,7 +622,10 @@ async function poll(){
        +` &nbsp; middle <b>${m.epe_mid.toFixed(3)}</b>`
        +` &nbsp; last <b>${m.epe_last.toFixed(3)}</b><br>`
        +`total motion <b>${m.total_motion.toFixed(1)} ${m.unit}</b>`
-       +` &nbsp;&middot;&nbsp; <b>${m.n_parameters.toLocaleString()}</b> parameters`
+       +` &nbsp;&middot;&nbsp; ` + (m.n_table===undefined ? "" :
+         `<b>${m.n_table.toLocaleString()}</b> hash table `+
+         `+ ${m.n_decoder.toLocaleString()} decoder = `)
+       +`<b>${m.n_parameters.toLocaleString()}</b> parameters`
        +`<br><span style="color:#7a7a7a">${r.note}</span>`;
   }
   if(SEEN_RUNNING && !r.running && POLL){ clearInterval(POLL); POLL=null; }

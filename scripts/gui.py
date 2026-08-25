@@ -265,6 +265,9 @@ def train_job(cfg, p, device):
 
         torch.manual_seed(cfg.get("seed", 0))
         model = build_model(spec, device)
+        # n_a is the table for a hash grid and the control tensor for the dense
+        # one -- the same slot, so the page can name it either way and the two
+        # parameterisations stay comparable number for number.
         n_a, n_b = model.n_parameters()
         is_hash = spec["kind"] == "hash_grid"
         enc = model.field.encoding if is_hash else None
@@ -279,6 +282,7 @@ def train_job(cfg, p, device):
             inert = ("" if n_hashed else
                      f"; table not binding -- the finest level has "
                      f"{finest_nodes:,} nodes and every level fits densely")
+        store = "hash table" if is_hash else "control tensor"
         note = (f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells, "
                 f"{sum(1 for d in enc.dense if not d)}/{enc.n_levels} levels hashed, "
                 f"{w / enc.resolutions[-1][0]:.1f} px per finest cell{inert}" if is_hash
@@ -289,9 +293,15 @@ def train_job(cfg, p, device):
               f"{int(p['steps'])} steps, lr {float(p['lr']):.1e}, "
               f"batch {int(p['batch']):,}, pyramid "
               f"{'on' if int(p.get('pyramid', 1)) else 'off'}", flush=True)
+        print(f"[params] {n_a + n_b:,} total = {n_a:,} in the {store} "
+              f"+ {n_b:,} in the decoder"
+              + (f"  ({enc.table.shape[0]:,} entries x {enc.table.shape[1]} "
+                 f"features)" if is_hash else ""), flush=True)
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
                        curve=[], metrics={"n_parameters": n_a + n_b,
+                                          "n_table": n_a, "n_decoder": n_b,
+                                          "store": store,
                                           "n_levels_total": n_lv_total}, note=note,
                        images={"source": gray_png(sc["source"]),
                                "target": gray_png(sc["observed"]),
@@ -380,6 +390,8 @@ def train_job(cfg, p, device):
                                          "epe_band": m["epe_band"],
                                          "epe_bg": m["epe_bg"]})
                     JOB["metrics"] = {**m, "n_parameters": n_a + n_b, "loss": photo,
+                                      "n_table": n_a, "n_decoder": n_b,
+                                      "store": store,
                                       "loss_kind": sc["loss"],
                                       "n_levels_total": n_lv_total}
                     JOB["images"].update(images)
@@ -750,8 +762,12 @@ function setupLine(r){
       +` &nbsp;&middot;&nbsp; <b>${sel.mismatch.replace(/_/g," ")}</b>`
       +` <span class="dim">intensity, ${loss} loss</span>`
       +` &nbsp;&middot;&nbsp; <b>${sel.model}</b>`;
-  if(m.n_parameters!==undefined)
-    t+=` <span class="dim">${m.n_parameters.toLocaleString()} parameters</span>`;
+  if(m.n_parameters!==undefined){
+    t+=` <span class="dim">${m.n_parameters.toLocaleString()} parameters`;
+    if(m.n_table!==undefined)
+      t+=`, ${m.n_table.toLocaleString()} of them in the ${m.store}`;
+    t+=`</span>`;
+  }
   if(r.note) t+=`<br><span class="dim">${r.note}</span>`;
   document.getElementById("setup").innerHTML=t;
 }
@@ -798,7 +814,10 @@ function stats(r){
     `psnr vs the clean warp <b>${m.psnr.toFixed(2)}</b> dB`+
     ` &nbsp;&middot;&nbsp; min det J <b>${m.det_min.toFixed(3)}</b>`+
     ` &nbsp; folded ${fold}`+
-    ` &nbsp;&middot;&nbsp; <b>${m.n_parameters.toLocaleString()}</b> parameters`;
+    ` &nbsp;&middot;&nbsp; ` + (m.n_table===undefined ? "" :
+      `<b>${m.n_table.toLocaleString()}</b> ${m.store} `+
+      `+ ${m.n_decoder.toLocaleString()} decoder = `) +
+    `<b>${m.n_parameters.toLocaleString()}</b> parameters`;
 }
 // Open on a running fit rather than an empty page: the default configuration is
 // the one worth seeing first, and it costs one keystroke to stop it.

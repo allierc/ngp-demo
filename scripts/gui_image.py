@@ -212,11 +212,16 @@ def train_job(p, device):
               f"lr {float(p['lr']):.1e}, batch {int(p['batch']):,}  -> "
               f"{info['n_total']:,} params "
               f"({info['fraction_of_values']*100:.1f}% of the image)", flush=True)
+        print(f"[params] {info['n_total']:,} total = {info['n_enc']:,} in the hash "
+              f"table ({model.encoding.table.shape[0]:,} entries x "
+              f"{model.encoding.table.shape[1]} features) + {info['n_mlp']:,} in "
+              f"the decoder", flush=True)
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
                        curve=[], ladder=ladder, metrics=info,
                        note=f"{w}x{h}x{c}, {info['n_total']:,} parameters "
-                            f"({info['fraction_of_values']*100:.1f}% of the "
+                            f"({info['n_enc']:,} in the hash table, "
+                            f"{info['fraction_of_values']*100:.1f}% of the "
                             f"{info['n_values']:,} reference values), "
                             f"{info['hashed_levels']}/{len(ladder)} levels hashed, "
                             f"{info['finest_px_per_cell']:.2f} px per finest cell",
@@ -746,7 +751,10 @@ async function poll(){
     document.getElementById("stats").innerHTML = m.psnr===undefined ? "press run"
       : `iteration <b>${r.step}</b> / ${r.steps} &nbsp;&middot;&nbsp; `
        +`${r.seconds.toFixed(1)} s &nbsp;&middot;&nbsp; psnr <b>${m.psnr.toFixed(2)}</b> dB`
-       +`<br><b>${m.n_total.toLocaleString()}</b> parameters `
+       +`<br>` + (m.n_enc===undefined ? "" :
+         `<b>${m.n_enc.toLocaleString()}</b> hash table `+
+         `+ ${m.n_mlp.toLocaleString()} decoder = `)
+       +`<b>${m.n_total.toLocaleString()}</b> parameters `
        +`(<b>${(m.fraction_of_values*100).toFixed(1)}%</b> of the `
        +`${m.n_values.toLocaleString()} reference RGB values) &nbsp;&middot;&nbsp; `
        +`finest cell covers <b>${m.finest_px_per_cell.toFixed(2)}</b> px`
