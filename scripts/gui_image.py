@@ -647,6 +647,7 @@ function drawLevels(bk){
     g.globalAlpha=1;
   });
   const used=[...new Set(bk.blocks.map(b=>b.level))].sort((a,b)=>a-b);
+  const tinted=bk.blocks.filter(b=>b.cell_px*s<3).length;
   let bar="";
   for(let i=0;i<=LUTMAX;i++)
     bar+=`<span style="display:inline-block;width:16px;height:10px;`
