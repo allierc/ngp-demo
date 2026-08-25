@@ -49,7 +49,7 @@ python scripts/fit_image.py                                   # stage 1, ~55 s
 python scripts/fit_field.py --interpolation smoothstep_xy     # stage 2, ~80 s
 python scripts/fit_field.py --isotropic                       # the control
 python scripts/compare_time.py                                # stage 2 figure
-python scripts/demo_gradients.py                              # stage 3
+python scripts/demo_gradients.py                              # derivatives of a fit
 python tests/test_ngp.py                                      # 9 passed
 python tests/level_specialisation.py                          # the negative result
 python tests/check_pages.py                                   # both GUI pages, needs node
@@ -98,7 +98,8 @@ generalization test.
 
 Capping the refinement at the data's own sampling is both smaller *and* better: the
 levels below the pixel spacing were spending parameters on structure no sample
-constrains. Stage 3 shows where that structure was hiding.
+constrains, and the cost of that shows up in the derivatives of the fit
+rather than in its PSNR.
 
 ## Stage 2 — a time-evolving field, scored on times it never saw
 
@@ -122,54 +123,7 @@ error strobing at the frame rate. Capping the time axis at the frame spacing lif
 the worst time from 21 dB to 38 dB. Note the ripple does not vanish — even the capped
 fit is ~20 dB better on a trained frame than between two.
 
-## Stage 3 — the derivatives
-
-All from `torch.autograd` through the frozen fit, no training.
-
-**The autograd path is exact.** Against central differences of the same model in
-float64 with a step 10⁻⁴ of a grid cell: **5.6e-10 median relative error**. The
-remaining 0.2% of points sit on a kink — a cell edge or a ReLU boundary — where the
-fit is only C⁰ and no finite difference can agree. Worth knowing: the float32
-gradient you actually get at run time differs from the float64 one by 5.4e-3.
-
-**Derivatives are only faithful above the scale the samples constrain.** The fitted
-image's gradient against the reference image's gradient:
-
-| compared at | rel L2 | cosine |
-|---|---|---|
-| the pixel scale | 1.247 | 0.367 |
-| low-passed, σ = 1 px | 0.755 | 0.627 |
-| low-passed, σ = 2 px | 0.572 | **0.675** |
-
-**Second derivatives need care.** At a time never trained on, relative L2 against the
-analytic field (0.009 on the value = a 47 dB fit):
-
-| interpolation | u | ∇u (x,y) | ∂u/∂t | ∇²u | PDE residual |
-|---|---|---|---|---|---|
-| linear | 0.009 | 0.118 | 0.056 | **1.011** | 0.132 |
-| smoothstep | 0.007 | 0.119 | 0.197 | 3.160 | 0.321 |
-| smoothstep on x,y + linear on t | 0.009 | 0.130 | 0.065 | 3.230 | 0.226 |
-
-Three things to read off that table.
-
-1. **A multilinear interpolant has zero second derivative**, so with `linear` the
-   encoding contributes no curvature at all and the Laplacian's relative L2 is 1.011
-   — exactly what predicting zero would score. If you regularise with a Laplacian or
-   a bending energy through a linear-interpolated hash grid, you are regularising
-   almost nothing.
-2. **Smoothstep restores real curvature but is not free.** Its weight derivative
-   `6w(1-w)` vanishes at every cell boundary and peaks mid-cell, so on an axis whose
-   cells line up with your samples it forces the first derivative to zero at the
-   sample points and inflates it between them: `∂u/∂t` degrades from 0.056 to 0.197.
-   Interpolating smoothstep in space and linear in time fixes it (0.065) and also
-   gives the best held-out PSNR of the four configurations.
-3. **Even with smoothstep the Laplacian is noise-dominated** (3.2× too large), because
-   fit error at the finest cell scale is amplified by 1/Δ². Sweeping the finest
-   spatial resolution over 48 / 96 / 192 / 256 cells moves it between 2.7 and 4.2
-   without fixing it. First derivatives (12–13% relative error) are usable; second
-   derivatives through a hash grid need explicit smoothing or supervision.
-
-## Stage 4 — registration: a hash grid against a control grid
+## Stage 3 — registration: a hash grid against a control grid
 
 `config/registration_benchmark.yaml` warps the painting by a known analytic field
 to make a target, then asks each parameterisation to recover it. Because `u_gt` is
@@ -264,7 +218,7 @@ What *is* true is narrower: entries only move where samples touch them, so a
 region with no data costs nothing. A level map therefore separates signal from
 no-signal -- on the painting, the black surround from the face -- and says
 nothing about the local scale of the structure. If capacity belongs at a
-particular scale, cap the finest level there. That is what stage 4 measured:
+particular scale, cap the finest level there. That is what stage 3 measured:
 34x fewer parameters, lower endpoint error and 64x less bending energy.
 
 ## What this encoder does that tiny-cuda-nn's does not
@@ -276,10 +230,11 @@ particular scale, cap the finest level there. That is what stage 4 measured:
   derivative supervision.
 * `base_resolution`, `per_level_scale`, `max_resolution` and `interpolation` are all
   settable **per axis**. That is what stage 2 needs (time capped at the frame
-  spacing) and what stage 3 needs (smoothstep in space, linear in time), and neither
-  is expressible in a single isotropic config.
+  spacing), and it is not expressible in a single isotropic config. The same is
+  true of `interpolation`: smoothstep in space with linear in time is the
+  configuration that both fits best and differentiates correctly.
 
-## The one rule the three stages keep repeating
+## The one rule every stage keeps repeating
 
 Resolve to the data, not past it. The image wanted its finest level at the pixel
 count; the field wanted its time axis at the frame spacing and its spatial axes at
