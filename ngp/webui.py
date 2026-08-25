@@ -189,12 +189,34 @@ resolution: a 512-cell-per-axis level in 3D has ~10^8 nodes, which nobody stores
 its table is still <code>T</code> entries, so refining it costs nothing.</p>
 
 <h2>Why collisions are the mechanism and not a defect</h2>
-<p>Two distant nodes sharing an entry receive the <i>sum</i> of their gradients.
-Where one of them sits in empty or unconstrained space it contributes almost
-nothing, so the entry is won automatically by whichever node the data actually
-constrains. No importance heuristic decides this and no pass detects it; the
-optimiser does it as a side effect. The honest failure case: two <i>equally</i>
-well-constrained distant regions do fight over one entry.</p>
+<p>When two distant nodes hash to the same entry, that entry's features are used
+for both, and in the backward pass it receives the <i>sum</i> of everything asked
+of it. Concretely, for a table entry <code>e</code>:</p>
+<p><code>dL/de = SUM over every sampled point whose cell has a corner mapping to e,
+of  w * dL/df</code></p>
+<p>where <code>w</code> is that corner's interpolation weight for that point and
+<code>dL/df</code> is the gradient arriving from the decoder. Three things scale each
+term, and all three are near zero in the region you do not care about:</p>
+<ul>
+<li><b>how many points land there.</b> Sampling is masked to the foreground, so an
+empty region contributes few terms or none at all.</li>
+<li><b>the interpolation weight.</b> A corner far from a query gets a small
+<code>w</code>, so even a point that does touch the cell may barely move it.</li>
+<li><b>the residual.</b> A region the fit already explains sends back almost no
+gradient, whatever its sample count.</li>
+</ul>
+<p>So the sum is dominated by whichever colliding node the data actually constrains,
+and the entry converges to the value that node needs while the other simply rides
+along on it. No importance heuristic decides this and no pass detects it; the
+optimiser does it as a side effect of ordinary training. It also self-limits:
+collisions only occur at the fine levels, where each entry is touched by few points,
+while the coarse levels that carry most of the signal are dense and collide with
+nothing.</p>
+<p>The honest failure case is the symmetric one. If both colliding regions are
+<i>equally</i> well constrained, neither term dominates and the entry settles on a
+gradient-weighted compromise that is wrong for both. Nothing detects that either
+&mdash; it shows up as a faint ghost of one region appearing in the other, and the
+fix is a larger table rather than a cleverer rule.</p>
 
 <h2>What is free, and what is not</h2>
 <p>An adaptive octree has to be built: decide where to subdivide, maintain the
