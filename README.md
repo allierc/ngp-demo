@@ -17,6 +17,31 @@ scripts/          fit_image.py, fit_field.py, compare_time.py, demo_gradients.py
 tests/            9 checks, including gradcheck w.r.t. coordinates and table
 ```
 
+## Try it in the browser
+
+Two pages, each a single self-contained server. They are the fastest way to see
+what any setting does, because the panels update while the fit runs.
+
+```bash
+python scripts/gui_image.py     # http://localhost:8022  -- fit the painting
+python scripts/gui.py           # http://localhost:8021  -- recover a known warp
+```
+
+`gui_image.py` puts every knob of the encoding on a slider and shows what that
+setting *builds* before you spend a minute training it: the resolution ladder
+level by level, which levels have to hash, the parameter count against the
+image's own value count. Finished runs stay on the curve, so settings compare
+directly on quality against time and parameters.
+
+`gui.py` warps the painting by a known analytic field and asks a hash grid or a
+control grid to recover it, scoring the *field* rather than the pixels. It
+starts fitting the default configuration as soon as you open it.
+
+Both carry a **what is an ngp?** button explaining the method and a **what is
+this interface?** button explaining every control on that page. Each prints
+`[run]`, `[images]` and `[done]` to the terminal, so an empty page can be told
+apart from a fit that never started.
+
 ## Run it
 
 ```bash
@@ -26,6 +51,8 @@ python scripts/fit_field.py --isotropic                       # the control
 python scripts/compare_time.py                                # stage 2 figure
 python scripts/demo_gradients.py                              # stage 3
 python tests/test_ngp.py                                      # 9 passed
+python tests/level_specialisation.py                          # the negative result
+python tests/check_pages.py                                   # both GUI pages, needs node
 ```
 
 Outputs (images, mp4s, figures, `report.json`) land in `out/`.
