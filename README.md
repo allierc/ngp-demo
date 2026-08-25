@@ -19,12 +19,13 @@ tests/            9 checks, including gradcheck w.r.t. coordinates and table
 
 ## Try it in the browser
 
-Two pages, each a single self-contained server. They are the fastest way to see
+Three pages, each a single self-contained server. They are the fastest way to see
 what any setting does, because the panels update while the fit runs.
 
 ```bash
 python scripts/gui_image.py     # http://localhost:8022  -- fit the painting
 python scripts/gui.py           # http://localhost:8021  -- recover a known warp
+python scripts/gui_time.py      # http://localhost:8024  -- a warp that moves
 ```
 
 `gui_image.py` puts every knob of the encoding on a slider and shows what that
@@ -37,10 +38,16 @@ directly on quality against time and parameters.
 control grid to recover it, scoring the *field* rather than the pixels. It
 starts fitting the default configuration as soon as you open it.
 
-Both carry a **what is an ngp?** button explaining the method and a **what is
-this interface?** button explaining every control on that page. Each prints
-`[run]`, `[images]` and `[done]` to the terminal, so an empty page can be told
-apart from a fit that never started.
+`gui_time.py` is the same recovery with the warp in motion: one `(x, y, t)`
+encoder against a slip band that translates or rotates across the run. Every
+panel is triplicated at the first, middle and last frame, so a fit that only
+works at one end of the run cannot hide.
+
+All three carry a **what is an ngp?** button explaining the method and a **what
+is this interface?** button explaining every control on that page. Each prints
+`[run]`, `[params]`, `[images]` and `[done]` to the terminal, so an empty page
+can be told apart from a fit that never started, and the parameter count is on
+the setup line next to the settings that produced it.
 
 ## Run it
 
@@ -52,7 +59,7 @@ python scripts/compare_time.py                                # stage 2 figure
 python scripts/demo_gradients.py                              # derivatives of a fit
 python tests/test_ngp.py                                      # 9 passed
 python tests/level_specialisation.py                          # the negative result
-python tests/check_pages.py                                   # both GUI pages, needs node
+python tests/check_pages.py                                   # all 3 GUI pages, needs node
 ```
 
 Outputs (images, mp4s, figures, `report.json`) land in `out/`.
@@ -186,89 +193,56 @@ Matched-intensity arm, endpoint error in pixels (foreground / band / background)
 * **`tensor_256` is the worst of both**: competitive in the foreground, 4.9-13.0 px
   in the band. Capacity without locality extrapolates badly exactly at the mask edge.
 
-### Resolve to the data, again -- and it is the Jacobian that pays
+## Stage 4 — a warp that moves
 
-| local_bending / matched | params | EPE fg | EPE bg | bending energy |
+`scripts/gui_time.py` puts the stage-3 recovery in motion: one `(x, y, t)` encoder
+against a slip band that translates or rotates over the run, with every panel
+triplicated at the first, middle and last frame.
+
+```bash
+python scripts/gui_time.py                    # http://localhost:8024
+```
+
+An 18 px slip band translating 300 px over the run, 400 steps, the time axis
+capped at 16 cells:
+
+| frames | px per frame | parameters | EPE mean | worst frame |
 |---|---|---|---|---|
-| finest 512 cells (1.8 px) | 2,356,738 | 0.062 | 0.422 | 2.07e-03 |
-| finest 512, hashed at 2^16 | 552,834 | 0.063 | 0.813 | 2.12e-03 |
-| **finest 128 cells (7.1 px)** | **69,428** | **0.053** | **0.402** | **3.24e-05** |
+| 100 | 3.030 | 1,036,930 | 0.119 | 0.141 |
+| 200 | 1.508 | 1,036,930 | 0.116 | 0.162 |
+| 500 | 0.601 | 1,036,930 | 0.121 | 0.159 |
+| 800 | 0.376 | 1,036,930 | 0.121 | 0.183 |
 
-34x fewer parameters, slightly better accuracy, and a **64x lower bending energy**.
-The deformation's finest feature is ~30 px, so every level below ~7 px/cell was
-inventing structure no sample constrains. As in stages 1-3 it costs almost nothing
-in the loss and everything in the derivative.
+**8x the frames costs nothing.** The parameter count is set by the cap on the
+time axis and not by how many frames were sampled, and the accuracy moves by
+0.005 px across the sweep. What the frame count changes is the sampling density
+along `t`, which this deformation does not need: the band moves smoothly, so 100
+samples of that motion already pin it.
 
-### Coarse-to-fine and an image pyramid are substitutes
+Speed and kind of motion, at 200 frames:
 
-| global_plus_local / matched | EPE fg | min det J |
+| motion over the run | EPE mean | worst frame |
 |---|---|---|
-| pyramid, level window on | 0.162 | 0.336 |
-| pyramid, level window off | **0.111** | 0.330 |
-| no pyramid, level window on | **0.115** | 0.206 |
-| no pyramid, level window off | **4.950** | **-4.831** |
+| 30 px translation | 0.078 | 0.102 |
+| 300 px translation | 0.116 | 0.162 |
+| 1200 px translation | 0.152 | 0.292 |
+| **90 deg rotation** | **1.263** | **3.141** |
 
-Either mechanism supplies the coarse-to-fine an intensity loss needs; without
-both, the fit lands 43x worse and folds. Running both is mildly counterproductive,
-since the level window only delays access to the fine levels. The level window is
-the cheaper of the two -- no blurred copies of the volume.
+40x the translation speed costs 2x the endpoint error. Rotation is 11x worse
+than any of them, and structurally so: the band's normal turns with it, so the
+field at `t` is not a shifted copy of the field at `t=0` and nothing along the
+time axis can be reused.
 
-Two bugs this stage caught, both of which would have produced confident wrong
-conclusions, are worth naming because they are easy to repeat:
+Raising the time axis past the cap does not help either -- 64 cells: 1,638,208
+parameters and 0.122 px, against 16 cells: 1,036,930 and 0.116. Asking for 200
+time cells returns the same 1,638,208, because at that point the table is full
+and the extra resolution only changes which nodes collide.
 
-1. A single absolute regulariser weight against two data terms of very different
-   magnitude (L2 ~1e-4, 1-LNCC ~3e-1) leaves the cross-modal arm effectively
-   unregularised. It looked like "modality mismatch causes folding" (10-23% folded
-   Jacobians against 0%); it was a missing weight.
-2. Ground-truth displacements of 12-42 px against a 9 px LNCC window give a
-   capture radius of ~4 px, so neither model could converge. That looked like a
-   model comparison; it was the objective. An image pyramid took the hash grid
-   from 11.59 to 1.27 px endpoint error and the control grid from 8.68 to 1.47.
-
-### The levels do not specialise by frequency
-
-A hash grid is often described as putting its fine levels where the fine
-structure is. It does not, and `tests/level_specialisation.py` is the standing
-check. Fit the encoder by plain regression -- no registration loss, no
-regulariser -- to a field that is smooth on its left half and 10x finer on its
-right at equal amplitude, and measure each level's contribution on each half:
-
-| cells per axis | left (smooth) | right (fine) | ratio |
-|---|---|---|---|
-| 8 | 0.0285 | 0.0165 | 0.58 |
-| 52 | 0.0378 | 0.0349 | 0.92 |
-| 134 | 0.0269 | 0.0286 | 1.06 |
-| 344 | 0.0075 | 0.0086 | 1.14 |
-
-The 344-cell level does as much work on the smooth side as on the fine side.
-Nothing in the architecture would do otherwise: every level is queried
-everywhere, the levels are summed into one feature vector, and a fine level
-represents a smooth function perfectly well by varying its entries slowly.
-
-What *is* true is narrower: entries only move where samples touch them, so a
-region with no data costs nothing. A level map therefore separates signal from
-no-signal -- on the painting, the black surround from the face -- and says
-nothing about the local scale of the structure. If capacity belongs at a
-particular scale, cap the finest level there. That is what stage 3 measured:
-34x fewer parameters, lower endpoint error and 64x less bending energy.
-
-## What this encoder does that tiny-cuda-nn's does not
-
-* Runs anywhere torch runs — no `nvcc`, no build. It is slower than the fused CUDA
-  kernel, but 55 s to 40 dB on a 3.9 Mpixel image is not the bottleneck for most uses.
-* Gradients flow to the **inputs** as well as the table, and double backward works,
-  so `∇f` and `∇²f` are available for PDE residuals, Jacobian penalties or
-  derivative supervision.
-* `base_resolution`, `per_level_scale`, `max_resolution` and `interpolation` are all
-  settable **per axis**. That is what stage 2 needs (time capped at the frame
-  spacing), and it is not expressible in a single isotropic config. The same is
-  true of `interpolation`: smoothstep in space with linear in time is the
-  configuration that both fits best and differentiates correctly.
-
-## The one rule every stage keeps repeating
-
-Resolve to the data, not past it. The image wanted its finest level at the pixel
-count; the field wanted its time axis at the frame spacing and its spatial axes at
-~20 cells per finest wavelength. Over-refining barely moves PSNR — which is why it is
-easy to miss — and shows up instead as sub-scale wiggle in the fit, which is invisible
-in the value and fatal in the derivative.
+The two error rows are there to be read together. On the default run the image
+residual is essentially black -- mean 1.9/255, under 1% of pixels above a tenth
+of its fixed 0-0.1 scale -- while the field still carries 0.116 px of endpoint
+error. **The picture matches and the field is still wrong**, which is the whole
+reason this benchmark scores the field. The pyramid row shows which level is
+finest in each 64 px block: the finest blocks track the band as it travels
+(centred at y = 437, 593, 704 over the three frames) and the flat regions
+either side are carried by L0-L3.

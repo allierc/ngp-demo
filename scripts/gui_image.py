@@ -424,7 +424,9 @@ function noteHTML(m){
   const col = f<50 ? "#2ea043" : (f<100 ? "#e5a23c" : "#e5484d");
   return `<span style="color:#fff">${m.width}&times;${m.height}&times;${m.channels}, `
        + `${m.n_total.toLocaleString()} parameters `
-       + `(<b style="color:${col}">${f.toFixed(1)}%</b> of the `
+       + `(${m.n_enc.toLocaleString()} in the hash table `
+       + `+ ${m.n_mlp.toLocaleString()} in the decoder, `
+       + `<b style="color:${col}">${f.toFixed(1)}%</b> of the `
        + `${m.n_values.toLocaleString()} reference values), `
        + `${m.hashed_levels}/${m.n_levels} levels hashed, `
        + `${m.finest_px_per_cell.toFixed(2)} px per finest cell</span>`;
@@ -751,10 +753,7 @@ async function poll(){
     document.getElementById("stats").innerHTML = m.psnr===undefined ? "press run"
       : `iteration <b>${r.step}</b> / ${r.steps} &nbsp;&middot;&nbsp; `
        +`${r.seconds.toFixed(1)} s &nbsp;&middot;&nbsp; psnr <b>${m.psnr.toFixed(2)}</b> dB`
-       +`<br>` + (m.n_enc===undefined ? "" :
-         `<b>${m.n_enc.toLocaleString()}</b> hash table `+
-         `+ ${m.n_mlp.toLocaleString()} decoder = `)
-       +`<b>${m.n_total.toLocaleString()}</b> parameters `
+       +`<br><b>${m.n_total.toLocaleString()}</b> parameters `
        +`(<b>${(m.fraction_of_values*100).toFixed(1)}%</b> of the `
        +`${m.n_values.toLocaleString()} reference RGB values) &nbsp;&middot;&nbsp; `
        +`finest cell covers <b>${m.finest_px_per_cell.toFixed(2)}</b> px`

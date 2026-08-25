@@ -228,7 +228,7 @@ def _evaluate(model, sc, device, spacing):
     vmax = max(1.0, float(sc["ugt_dense"].norm(dim=-1).max()))
     images = {"warped": gray_png(warped),
               "epe": cmap_png(epe.cpu().numpy(), EPE_LUT_MAX),
-              "residual": cmap_png((warped - target_clean).abs().cpu().numpy(),
+              "residual": cmap_png((warped - sc["clean"]).abs().cpu().numpy(),
                                    RESID_LUT_MAX),
               "ufit": flow_png(u.reshape(h, w, 2).cpu().numpy(), vmax)}
     grid = {"fit": grid_lines(un, spacing, shape),
@@ -292,7 +292,8 @@ def train_job(cfg, p, device):
         print(f"[run] {p['deformation']} / {p['mismatch']} / {p['model']}  "
               f"{int(p['steps'])} steps, lr {float(p['lr']):.1e}, "
               f"batch {int(p['batch']):,}, pyramid "
-              f"{'on' if int(p.get('pyramid', 1)) else 'off'}", flush=True)
+              f"{'on' if int(p.get('pyramid', 1)) else 'off'}  ->  "
+              f"{n_a + n_b:,} parameters", flush=True)
         print(f"[params] {n_a + n_b:,} total = {n_a:,} in the {store} "
               f"+ {n_b:,} in the decoder"
               + (f"  ({enc.table.shape[0]:,} entries x {enc.table.shape[1]} "
@@ -762,10 +763,14 @@ function setupLine(r){
       +` &nbsp;&middot;&nbsp; <b>${sel.mismatch.replace(/_/g," ")}</b>`
       +` <span class="dim">intensity, ${loss} loss</span>`
       +` &nbsp;&middot;&nbsp; <b>${sel.model}</b>`;
+  // white, not dim: the parameter count is a setting like the others above it,
+  // decided before the first step, and not a running metric.
   if(m.n_parameters!==undefined){
-    t+=` <span class="dim">${m.n_parameters.toLocaleString()} parameters`;
+    t+=` &nbsp;&middot;&nbsp; <span style="color:#fff">`
+      +`${m.n_parameters.toLocaleString()} parameters`;
     if(m.n_table!==undefined)
-      t+=`, ${m.n_table.toLocaleString()} of them in the ${m.store}`;
+      t+=`, ${m.n_table.toLocaleString()} in the ${m.store} `
+        +`+ ${m.n_decoder.toLocaleString()} in the decoder`;
     t+=`</span>`;
   }
   if(r.note) t+=`<br><span class="dim">${r.note}</span>`;
@@ -814,10 +819,7 @@ function stats(r){
     `psnr vs the clean warp <b>${m.psnr.toFixed(2)}</b> dB`+
     ` &nbsp;&middot;&nbsp; min det J <b>${m.det_min.toFixed(3)}</b>`+
     ` &nbsp; folded ${fold}`+
-    ` &nbsp;&middot;&nbsp; ` + (m.n_table===undefined ? "" :
-      `<b>${m.n_table.toLocaleString()}</b> ${m.store} `+
-      `+ ${m.n_decoder.toLocaleString()} decoder = `) +
-    `<b>${m.n_parameters.toLocaleString()}</b> parameters`;
+    ` &nbsp;&middot;&nbsp; <b>${m.n_parameters.toLocaleString()}</b> parameters`;
 }
 // Open on a running fit rather than an empty page: the default configuration is
 // the one worth seeing first, and it costs one keystroke to stop it.

@@ -104,8 +104,7 @@ def train_job(cfg, p, device):
                 f"{gt.total():.0f} {unit} in total = {gt.speed:.4g} {unit}/frame, "
                 f"band width {gt.width:.0f} px; "
                 f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells in space, "
-                f"{enc.resolutions[-1][2]} in time; {n_enc + n_mlp:,} parameters, "
-                f"{n_enc:,} of them in the hash table")
+                f"{enc.resolutions[-1][2]} in time")
         picks = [0, n_frames // 2, n_frames - 1]
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
@@ -419,7 +418,8 @@ function seg(name, opts, key){
     const b=document.createElement("button"); b.textContent=txt;
     b.setAttribute("aria-pressed", knob[key]===val);
     b.onclick=()=>{ knob[key]=val;
-      [...s.children].forEach(c=>c.setAttribute("aria-pressed",c===b)); setup(); };
+      [...s.children].forEach(c=>c.setAttribute("aria-pressed",c===b));
+      PARAMS=""; setup(); };
     s.appendChild(b); });
   g.append(l,s); C.appendChild(g);
 }
@@ -444,13 +444,19 @@ function panel(title, list){
     r.min=raw(p.min); r.max=raw(p.max); r.step=p.log?0.02:p.step; r.value=raw(knob[p.name]);
     const ends=document.createElement("div"); ends.className="ends";
     ends.innerHTML=`<span>${fmt(p.min)}</span><span>${fmt(p.max)}</span>`;
-    r.oninput=()=>{ knob[p.name]=un(r.value); val.textContent=fmt(knob[p.name]); setup(); };
+    r.oninput=()=>{ knob[p.name]=un(r.value); val.textContent=fmt(knob[p.name]);
+                    PARAMS=""; setup(); };
     d.append(lab,r,ends); K.appendChild(d);
   });
 }
 panel("the motion and the encoder", KNOBS.model);
 panel("training", KNOBS.train);
 
+// The parameter count belongs on the setup line and not in the metrics: it is a
+// property of the SETTINGS, fixed before the first step. Cleared on any knob
+// edit, because from that moment it describes the run in flight and not the one
+// the sentence above now describes.
+let PARAMS="";
 function setup(){
   const unit = knob.motion==="translate" ? "px" : "deg";
   const per = knob.total/Math.max(1, knob.frames-1);
@@ -459,7 +465,7 @@ function setup(){
     +`<span class="dim">slip band that</span> <b>${knob.motion}s</b> `
     +`<b>${(+knob.total).toFixed(0)} ${unit}</b> <span class="dim">over</span> `
     +`<b>${knob.frames}</b> <span class="dim">frames =</span> `
-    +`<b>${per.toFixed(4)} ${unit}/frame</b>`;
+    +`<b>${per.toFixed(4)} ${unit}/frame</b>`+PARAMS;
 }
 setup();
 
@@ -611,6 +617,13 @@ async function poll(){
     }
     drawFrames(r.per_frame, r.frames); drawCurve(r.curve);
     const m=r.metrics||{};
+  if(m.n_parameters!==undefined && m.n_table!==undefined){
+    const np=` <span class="dim">&middot;</span> <span style="color:#fff">`
+      +`${m.n_parameters.toLocaleString()} parameters, `
+      +`${m.n_table.toLocaleString()} in the hash table `
+      +`+ ${m.n_decoder.toLocaleString()} in the decoder</span>`;
+    if(np!==PARAMS){ PARAMS=np; setup(); }
+  }
     document.getElementById("stats").innerHTML = m.epe_mean===undefined
       ? (r.running?"running&hellip;":"")
       : `iteration <b>${r.step}</b> / ${r.steps} &nbsp;&middot;&nbsp; `
@@ -622,10 +635,6 @@ async function poll(){
        +` &nbsp; middle <b>${m.epe_mid.toFixed(3)}</b>`
        +` &nbsp; last <b>${m.epe_last.toFixed(3)}</b><br>`
        +`total motion <b>${m.total_motion.toFixed(1)} ${m.unit}</b>`
-       +` &nbsp;&middot;&nbsp; ` + (m.n_table===undefined ? "" :
-         `<b>${m.n_table.toLocaleString()}</b> hash table `+
-         `+ ${m.n_decoder.toLocaleString()} decoder = `)
-       +`<b>${m.n_parameters.toLocaleString()}</b> parameters`
        +`<br><span style="color:#7a7a7a">${r.note}</span>`;
   }
   if(SEEN_RUNNING && !r.running && POLL){ clearInterval(POLL); POLL=null; }
