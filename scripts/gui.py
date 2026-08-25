@@ -350,6 +350,16 @@ telling them apart.</p>
 // A page that fails in the browser but passes every offline check leaves no
 // trace at all: the panels are simply black. Report the exception to the server
 // so it lands in the terminal next to [run] and [images].
+// One-shot breadcrumbs, so "the panels are empty" can be told apart from
+// "poll never ran" and from "poll ran and painting did nothing" without a
+// browser console.
+const _said = {};
+function _log(tag, what){
+  if (_said[tag]) return;
+  _said[tag] = true;
+  try { fetch("/api/clientlog?msg=" + encodeURIComponent(tag + ": " + what)); }
+  catch (e) {}
+}
 function _report(what){
   try { fetch("/api/clienterror?msg=" + encodeURIComponent(String(what).slice(0, 800))); }
   catch (e) {}
@@ -365,7 +375,7 @@ const SPEC=__SPEC__, KNOBS=__KNOBS__, DEF=__DEF__;
 const sel={deformation:SPEC.deformation[0], mismatch:SPEC.mismatch[0],
            model:SPEC.model[0]};
 const knob=Object.assign({}, DEF);
-let LAST=-1, POLL=null, IMG={};
+let LAST=-1, POLL=null, IMG={}, SEEN_RUNNING=false;
 
 const C=document.getElementById("controls");
 function group(name, opts, key){
@@ -466,6 +476,7 @@ function buildKnobs(){
 buildKnobs();
 
 async function startRun(){
+  SEEN_RUNNING=false;
   const q=new URLSearchParams(Object.assign({}, sel, knob));
   await fetch("/api/start?"+q);
   if(POLL) clearInterval(POLL);
@@ -485,6 +496,10 @@ function blit(g,cv,im){
   const s=Math.min(cv.width/im.width, cv.height/im.height);
   const w=im.width*s, h=im.height*s;
   g.drawImage(im,(cv.width-w)/2,(cv.height-h)/2,w,h);
+  const r=cv.getBoundingClientRect();
+  _log("paint", `${cv.id} image ${im.width}x${im.height} -> canvas `
+               +`${cv.width}x${cv.height}, on screen `
+               +`${Math.round(r.width)}x${Math.round(r.height)}`);
 }
 
 function drawGrid(gr){
@@ -550,6 +565,9 @@ function setupLine(r){
 }
 async function poll(){
   const r=await (await fetch("/api/state")).json();
+  _log("poll", `stamp=${r.stamp} step=${r.step} running=${r.running} `
+              +`images=[${Object.keys(r.images || {})}] `
+              +`grid=${r.grid && r.grid.gt ? "yes" : "no"}`);
   setupLine(r);
   document.getElementById("prog").style.width=
     (r.steps ? (r.step/r.steps*100) : 0)+"%";
@@ -560,7 +578,10 @@ async function poll(){
     drawImg("c_warp", r.images.warped);   drawImg("c_epe", r.images.epe);
     drawGrid(r.grid); drawCurve(r.curve); stats(r);
   }
-  if(!r.running && POLL){ clearInterval(POLL); POLL=null; }
+  // Only stop once the run has actually been observed running: a not-yet-started
+  // job and a finished one look identical from here.
+  if(r.running) SEEN_RUNNING=true;
+  if(SEEN_RUNNING && !r.running && POLL){ clearInterval(POLL); POLL=null; }
 }
 function stats(r){
   const m=r.metrics||{};
@@ -638,10 +659,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(json.dumps({"error": "already running"}),
                                   "application/json")
             STOP.clear()
+            # RUNNING FROM THE MOMENT THE JOB IS ACCEPTED, not from the moment the
+            # worker gets going. The thread has to build the scene first, and a poll
+            # that lands in that window used to see running=false and cancel itself,
+            # so the page waited forever on a fit that was running fine.
+            with LOCK:
+                JOB["running"] = True
+                JOB["stamp"] += 1
             p = dict(KNOB_DEFAULTS)
             p.update({k: (float(v) if _isnum(v) else v) for k, v in q.items()})
             threading.Thread(target=train_job, args=(self.cfg, p, self.device),
                              daemon=True).start()
+            return self._send(json.dumps({"ok": True}), "application/json")
+        if u.path == "/api/clientlog":
+            print(f"[browser] {q.get('msg', '')}", flush=True)
             return self._send(json.dumps({"ok": True}), "application/json")
         if u.path == "/api/clienterror":
             print(f"[client] {q.get('msg', '')}", flush=True)

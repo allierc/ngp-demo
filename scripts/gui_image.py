@@ -375,7 +375,7 @@ function closeAbout(){document.getElementById("about").classList.remove("open");
 document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
 const KNOBS=__KNOBS__, TRAIN=__TRAIN__, DEF=__DEF__, LUTMAX=__LUTMAX__;
 const knob=Object.assign({}, DEF);
-let LAST=-1, POLL=null, IMG={};
+let LAST=-1, POLL=null, IMG={}, SEEN_RUNNING=false;
 // Declared up here, not beside the drawing code: the magnifier toggle below is
 // built while the controls are, and a `const` referenced before its declaration
 // is a ReferenceError that kills the whole script rather than one handler.
@@ -700,7 +700,10 @@ async function poll(){
        +`finest cell covers <b>${m.finest_px_per_cell.toFixed(2)}</b> px`
        +` &nbsp;&middot;&nbsp; ${m.hashed_levels} levels hashed`;
   }
-  if(!r.running && POLL){ clearInterval(POLL); POLL=null; }
+  // Only stop once the run has actually been observed running: a not-yet-started
+  // job and a finished one look identical from here.
+  if(r.running) SEEN_RUNNING=true;
+  if(SEEN_RUNNING && !r.running && POLL){ clearInterval(POLL); POLL=null; }
 }
 zoomNote(); preview(); poll();
 </script></body></html>
@@ -756,6 +759,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(json.dumps({"error": "already running"}),
                                   "application/json")
             STOP.clear()
+            # RUNNING FROM THE MOMENT THE JOB IS ACCEPTED, not from the moment the
+            # worker gets going. The thread has to build the scene first, and a poll
+            # that lands in that window used to see running=false and cancel itself,
+            # so the page waited forever on a fit that was running fine.
+            with LOCK:
+                JOB["running"] = True
+                JOB["stamp"] += 1
             threading.Thread(target=train_job, args=(_params(q), self.device),
                              daemon=True).start()
             return self._send(json.dumps({"ok": True}), "application/json")
