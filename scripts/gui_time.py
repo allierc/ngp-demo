@@ -40,8 +40,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ngp.deform import (RigidMotion, build_pyramid, field_jacobian, pixel_grid,
-                        pyramid_level, sample_bilinear)
+from ngp.deform import (MovingBand, build_pyramid, pixel_grid, pyramid_level,
+                        sample_bilinear)
 from ngp.model import NGPField
 from ngp.utils import psnr
 from ngp.webui import ABOUT_HTML, CSS, cmap_png, flow_png, gray_png
@@ -79,7 +79,9 @@ def train_job(cfg, p, device):
         h, w = shape
         px = torch.tensor([w, h], device=device, dtype=torch.float32)
         n_frames = int(p["frames"])
-        gt = RigidMotion(p["motion"], float(p["total"]), n_frames, shape, device=device)
+        gt = MovingBand(p["motion"], float(p["total"]), n_frames, shape,
+                        width_px=float(p["band_width"]),
+                        offset_px=float(p["band_offset"]), device=device)
 
         torch.manual_seed(0)
         model = NGPField(
@@ -96,9 +98,10 @@ def train_job(cfg, p, device):
         # with the sampled frames, smoothstep forces du/dt to zero at each one.
         enc = model.encoding
         n_enc, n_mlp = model.n_parameters()
-        unit = "px" if p["motion"] == "translation" else "deg"
-        note = (f"{n_frames} frames, {p['motion']} of {gt.total():.1f} {unit} in total "
-                f"= {gt.speed:.4g} {unit}/frame; "
+        unit = "px" if p["motion"] == "translate" else "deg"
+        note = (f"{n_frames} frames, a {gt.offset:.0f} px slip band {p['motion']}s "
+                f"{gt.total():.0f} {unit} in total = {gt.speed:.4g} {unit}/frame, "
+                f"band width {gt.width:.0f} px; "
                 f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells in space, "
                 f"{enc.resolutions[-1][2]} in time; {n_enc + n_mlp:,} parameters")
         picks = [0, n_frames // 2, n_frames - 1]
@@ -143,7 +146,7 @@ def train_job(cfg, p, device):
             u = model(xyt)
             # the target at that instant, generated analytically -- no need to
             # hold N warped copies of the painting in memory
-            ugt = gt_batch(gt, xy, tt)          # analytic, one t per sampled point
+            ugt = gt(xy, tt)                    # analytic, one t per sampled point
             pred = sample_bilinear(img, xy + u / px)
             tgt = sample_bilinear(img, xy + ugt / px)
             loss = ((pred - tgt) ** 2).mean()
@@ -182,19 +185,6 @@ def train_job(cfg, p, device):
               f"{JOB['seconds']:.1f}s  mean EPE {m.get('epe_mean', float('nan')):.3f} px "
               f"(first {m.get('epe_first', float('nan')):.3f}, "
               f"last {m.get('epe_last', float('nan')):.3f})", flush=True)
-
-
-def gt_batch(gt, xy, tt):
-    """Ground-truth displacement for a batch with a different t per row."""
-    if gt.kind == "translation":
-        f = tt * (gt.n - 1)
-        return gt.dir.unsqueeze(0) * (gt.speed * f)
-    th = torch.deg2rad(tt * (gt.n - 1) * gt.speed)                    # (N, 1)
-    d = (xy - gt.centre) * gt.px
-    c, s = torch.cos(th), torch.sin(th)
-    rot = torch.cat([d[:, :1] * c - d[:, 1:] * s,
-                     d[:, :1] * s + d[:, 1:] * c], dim=1)
-    return rot - d
 
 
 def warp_t(src, gt, t, shape, chunk=1 << 20):
@@ -275,8 +265,10 @@ PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>ngp over a moving field</title>
 <style>__CSS__</style></head><body><div class="wrap">
 <h1>one encoder over (x, y, t) &mdash; a field that moves</h1>
-<p class="sub">The painting drifts or rotates over N frames and a single hash grid
-holds the whole sequence. Three columns: the first frame, the middle one, the last.
+<p class="sub">A slip band travels or turns across the painting over N frames, and a
+single hash grid holds the whole sequence. The deformation PATTERN moves: the band sits
+somewhere different in every frame, so the encoder has to put its detail somewhere
+different too. Three columns: the first frame, the middle one, the last.
 A fit can be excellent where it was pushed hardest and drift at the ends, or hold
 the ends and sag between them, and neither shows in one frame &mdash; the curve
 scores every frame so which one is happening is a fact.</p>
@@ -364,7 +356,7 @@ function seg(name, opts, key){
     s.appendChild(b); });
   g.append(l,s); C.appendChild(g);
 }
-seg("motion", [["translation","translation"],["rotation","rotation"]], "motion");
+seg("the band", [["translates","translate"],["rotates","rotate"]], "motion");
 seg("frames", [["100",100],["200",200],["500",500],["800",800]], "frames");
 seg("image pyramid", [["on",1],["off",0]], "pyramid");
 
@@ -393,11 +385,12 @@ panel("the motion and the encoder", KNOBS.model);
 panel("training", KNOBS.train);
 
 function setup(){
-  const unit = knob.motion==="translation" ? "px" : "deg";
+  const unit = knob.motion==="translate" ? "px" : "deg";
   const per = knob.total/Math.max(1, knob.frames-1);
   document.getElementById("setup").innerHTML=
-    `<b>${knob.motion}</b> <span class="dim">of</span> `
-    +`<b>${(+knob.total).toFixed(0)} ${unit}</b> <span class="dim">in total, over</span> `
+    `<span class="dim">a</span> <b>${(+knob.band_offset).toFixed(0)} px</b> `
+    +`<span class="dim">slip band that</span> <b>${knob.motion}s</b> `
+    +`<b>${(+knob.total).toFixed(0)} ${unit}</b> <span class="dim">over</span> `
     +`<b>${knob.frames}</b> <span class="dim">frames =</span> `
     +`<b>${per.toFixed(4)} ${unit}/frame</b>`;
 }
@@ -529,8 +522,12 @@ poll(); startRun();
 
 KNOB_SPEC = {
     "model": [
-        {"name": "total", "label": "total motion over the sequence (px or deg)",
-         "min": 2, "max": 300, "default": 80, "step": 1, "log": True},
+        {"name": "total", "label": "how far the band moves over the sequence (px or deg)",
+         "min": 10, "max": 720, "default": 300, "step": 5, "log": True},
+        {"name": "band_offset", "label": "slip across the band (px)", "min": 2,
+         "max": 60, "default": 18, "step": 1},
+        {"name": "band_width", "label": "band width (px)", "min": 2, "max": 120,
+         "default": 12, "step": 1},
         {"name": "n_levels", "label": "levels", "min": 2, "max": 16, "default": 8,
          "step": 1},
         {"name": "max_resolution", "label": "finest cells per axis, space",
@@ -550,7 +547,7 @@ KNOB_SPEC = {
     ],
 }
 KNOB_DEFAULTS = {k["name"]: k["default"] for grp in KNOB_SPEC.values() for k in grp}
-KNOB_DEFAULTS.update(motion="translation", frames=200, pyramid=1)
+KNOB_DEFAULTS.update(motion="translate", frames=200, pyramid=1)
 
 
 class Handler(BaseHTTPRequestHandler):

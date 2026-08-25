@@ -255,6 +255,67 @@ class RigidMotion:
         return lambda xy: self(xy, t)
 
 
+class MovingBand:
+    """A slip band that travels or turns: the deformation PATTERN moves, not the image.
+
+    The distinction matters. Rigidly translating the picture gives a field that
+    is the same constant everywhere and merely grows with t -- an encoder can
+    fit that with almost no spatial capacity at all. Here the field has a sharp
+    feature at a definite place, and that place changes with time, so the
+    encoder has to put detail somewhere different in every frame. That is the
+    shape of a real moving deformation, and the one this repo's spatial results
+    were about.
+
+    u(x, t) = offset * clamp(s / width, -1, 1) * parallel,  s = (x - c(t)) . normal
+
+    `kind="translate"` sweeps the band's centre along its own normal;
+    `kind="rotate"` turns it about the middle of the image. `total` is the
+    distance in pixels or the angle in degrees covered across the whole
+    sequence, so a frame-count sweep changes the sampling and not the motion.
+    """
+
+    def __init__(self, kind="translate", total=300.0, n_frames=200,
+                 shape=(1069, 904), width_px=12.0, offset_px=18.0,
+                 angle_deg=35.0, device="cpu"):
+        self.kind = kind
+        self.total_motion = float(total)
+        self.n = int(n_frames)
+        self.speed = self.total_motion / max(1, self.n - 1)
+        h, w = shape
+        self.px = torch.tensor([w, h], device=device, dtype=torch.float32)
+        self.centre = torch.tensor([0.5, 0.5], device=device)
+        self.width = float(width_px)
+        self.offset = float(offset_px)
+        self.angle0 = float(angle_deg)
+        self.device = device
+
+    def total(self):
+        return self.total_motion
+
+    def __call__(self, xy, t):
+        """xy: (N, 2) in [0,1]^2;  t: a scalar or an (N, 1) tensor in [0, 1]."""
+        tt = (t if torch.is_tensor(t) else
+              torch.full((xy.shape[0], 1), float(t), device=xy.device))
+        if tt.dim() == 1:
+            tt = tt.unsqueeze(1)
+        deg = self.angle0 + (self.total_motion * tt if self.kind == "rotate" else 0.0)
+        th = torch.deg2rad(deg if torch.is_tensor(deg)
+                           else torch.full_like(tt, float(deg)))
+        c, s = torch.cos(th), torch.sin(th)
+        nrm = torch.cat([-s, c], dim=1)                        # (N, 2)
+        par = torch.cat([c, s], dim=1)
+        # the band centre travels along its own normal, centred on the middle
+        shift = (self.total_motion * (tt - 0.5)) if self.kind == "translate" else \
+                torch.zeros_like(tt)
+        d = (xy - self.centre) * self.px - nrm * shift
+        sdist = (d * nrm).sum(1, keepdim=True)                 # signed distance, px
+        prof = (sdist / self.width).clamp(-1.0, 1.0)
+        return self.offset * prof * par
+
+    def at(self, t):
+        return lambda xy: self(xy, t)
+
+
 class MultiScaleBands:
     """Displacement whose spatial SCALE varies across the frame, at constant amplitude.
 
