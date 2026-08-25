@@ -249,7 +249,7 @@ def train_job(cfg, p, device):
             gt = sample_bilinear(tgt_p[lvl], xy)
             loss = (lncc_loss(pred, gt, n_patch) if sc["loss"] == "lncc"
                     else ((pred - gt) ** 2).mean())
-            photo = float(loss)
+            photo = loss.detach().item()
             if w_smooth > 0 or w_fold > 0:
                 xr = sample_points(sc["fg_idx"], reg_n, frac, shape, device)
                 J = field_jacobian(model, xr, px, create_graph=True)

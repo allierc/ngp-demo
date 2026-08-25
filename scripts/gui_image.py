@@ -230,8 +230,8 @@ def train_job(p, device):
                     JOB["step"] = step
                     JOB["seconds"] = t_train
                     JOB["curve"].append({"step": step, "t": t_train, "psnr": db,
-                                         "loss": float(loss)})
-                    JOB["metrics"] = {**info, "psnr": db, "loss": float(loss)}
+                                         "loss": loss.detach().item()})
+                    JOB["metrics"] = {**info, "psnr": db, "loss": loss.detach().item()}
                     JOB["images"]["fit"] = gray_png(fit)
                     JOB["images"]["error"] = cmap_png(err, ERROR_LUT_MAX)
                     JOB["stamp"] += 1
