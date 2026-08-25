@@ -43,7 +43,8 @@ function el(id) {
     appendChild: c => { e.children.push(c); return c; },
     append: (...c) => { e.children.push(...c); },
     setAttribute: noop, getAttribute: () => null, addEventListener: noop,
-    removeEventListener: noop, getContext: ctx, focus: noop, click: noop,
+    removeEventListener: noop, getContext: ctx, focus: noop,
+    click: () => { if (typeof e.onclick === "function") e.onclick({}); },
     getBoundingClientRect: () => ({left: 0, top: 0, width: 330, height: 460}),
   };
   return e;
@@ -57,15 +58,23 @@ global.document = {
 };
 global.window = global;
 global.Image = class { constructor() { this.width = 330; this.height = 460; } };
-global.fetch = () => Promise.resolve({json: () => Promise.resolve({
+global.CALLS = [];
+global.fetch = (u) => { global.CALLS.push(String(u));
+  return Promise.resolve({json: () => Promise.resolve({
   running: false, step: 0, steps: 0, seconds: 0, curve: [], metrics: {},
   images: {}, grid: {}, blocks: {}, ladder: [], history: [], note: "",
-  stamp: 0, info: {}})});
+  stamp: 0, info: {}})}); };
 global.setInterval = () => 0;
 global.clearInterval = noop;
 global.setTimeout = (f) => 0;
 global.clearTimeout = noop;
 global.requestAnimationFrame = () => 0;
+process.on("exit", () => {
+  if (global.EXPECT_START && !global.CALLS.some(u => u.includes("/api/start"))) {
+    console.error("page never called /api/start on load");
+    process.exitCode = 1;
+  }
+});
 """
 
 
@@ -103,7 +112,10 @@ def check(script: str, port: int) -> bool:
         js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
         path = f"/tmp/_page_{port}.js"
         with open(path, "w") as f:
-            f.write(STUB + "\n" + js)
+            # gui.py starts a fit as soon as it opens; assert that it really does.
+            f.write(STUB + ("\nglobal.EXPECT_START = true;\n"
+                            if "gui.py" in script and "image" not in script else "\n")
+                    + js)
         r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             print(f"  {script}: page script threw\n"

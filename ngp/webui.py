@@ -103,6 +103,10 @@ CSS = """
   .bar { height:2px; background:#222; margin:14px 0 0; }
   .bar i { display:block; height:2px; background:var(--fg); width:0; }
   .note { font-size:11px; color:#7a7a7a; margin-top:6px; }
+  .setup { font-size:12px; color:#fff; margin:12px 0 2px;
+           font-variant-numeric:tabular-nums; }
+  .setup b { font-weight:600; }
+  .setup span.dim { color:var(--dim); }
   table.ladder { border-collapse:collapse; font-size:11px;
                  font-variant-numeric:tabular-nums; }
   table.ladder th { text-align:right; font-weight:600; color:var(--dim);

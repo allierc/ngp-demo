@@ -199,6 +199,10 @@ def train_job(cfg, p, device):
                 else f"{spec['grid'][0]}x{spec['grid'][1]} control points, "
                      f"{w / spec['grid'][1]:.0f} px apart")
 
+        print(f"[run] {p['deformation']} / {p['mismatch']} / {p['model']}  "
+              f"{int(p['steps'])} steps, lr {float(p['lr']):.1e}, "
+              f"batch {int(p['batch']):,}, pyramid "
+              f"{'on' if int(p.get('pyramid', 1)) else 'off'}", flush=True)
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
                        curve=[], metrics={"n_parameters": n_a + n_b}, note=note,
@@ -277,12 +281,22 @@ def train_job(cfg, p, device):
                     JOB["grid"] = grid
                     JOB["stamp"] += 1
     except Exception as e:                                   # surface, don't swallow
+        print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
         with LOCK:
             JOB["note"] = f"{type(e).__name__}: {e}"
     finally:
         with LOCK:
             JOB["running"] = False
             JOB["stamp"] += 1
+            m, done = JOB["metrics"], JOB["step"] >= JOB["steps"] > 0
+        verb = "done " if done else "stopped"
+        if "epe_fg" in m:
+            print(f"[{verb}] {JOB['seconds']:.1f}s  psnr {m['psnr']:.2f} dB  "
+                  f"EPE fg {m['epe_fg']:.3f} / band {m['epe_band']:.3f} / "
+                  f"bg {m['epe_bg']:.3f} px  folded {m['folded_count']}/"
+                  f"{m['jacobian_samples']}", flush=True)
+        else:
+            print(f"[{verb}] {JOB['seconds']:.1f}s", flush=True)
 
 
 PAGE = r"""<!doctype html>
@@ -305,20 +319,21 @@ telling them apart.</p>
   <div class="seg"><button id="run">run</button><button id="stop">stop</button></div>
 </div></div>
 <div class="bar"><i id="prog"></i></div>
+<div class="setup" id="setup"></div>
+<div class="row equal" style="margin-top:8px">
+  <div class="panel"><canvas id="c_source" width="330" height="460"></canvas>
+    <div class="cap">source</div></div>
+  <div class="panel"><canvas id="c_target" width="330" height="460"></canvas>
+    <div class="cap">target &mdash; source warped, then remapped</div></div>
+  <div class="panel"><canvas id="c_warp" width="330" height="460"></canvas>
+    <div class="cap">source warped by the fit</div></div>
+  <div class="panel"><canvas id="c_grid" width="330" height="460"></canvas>
+    <div class="cap">grid &mdash; <i>ground truth</i> vs <b>fit</b></div></div>
+</div>
 <div class="note" id="note"></div>
 <div class="row" style="margin-top:18px">
-  <div class="panel"><canvas id="c_source" width="390" height="460"></canvas>
-    <div class="cap">source</div></div>
-  <div class="panel"><canvas id="c_target" width="390" height="460"></canvas>
-    <div class="cap">target &mdash; source warped, then remapped</div></div>
-  <div class="panel"><canvas id="c_warp" width="390" height="460"></canvas>
-    <div class="cap">source warped by the fit</div></div>
-</div>
-<div class="row" style="margin-top:18px">
-  <div class="panel"><canvas id="c_epe" width="390" height="460"></canvas>
+  <div class="panel"><canvas id="c_epe" width="330" height="460"></canvas>
     <div class="cap">endpoint error, px</div></div>
-  <div class="panel"><canvas id="c_grid" width="390" height="460"></canvas>
-    <div class="cap">grid &mdash; <i>ground truth</i> vs <b>fit</b></div></div>
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
     <div class="cap">loss and endpoint error against iteration</div></div>
 </div>
@@ -433,12 +448,13 @@ function buildKnobs(){
 }
 buildKnobs();
 
-document.getElementById("run").onclick=async()=>{
+async function startRun(){
   const q=new URLSearchParams(Object.assign({}, sel, knob));
   await fetch("/api/start?"+q);
   if(POLL) clearInterval(POLL);
   POLL=setInterval(poll, 400); poll();
-};
+}
+document.getElementById("run").onclick=startRun;
 document.getElementById("stop").onclick=()=>fetch("/api/stop");
 
 function drawImg(id, src){
@@ -503,11 +519,24 @@ function drawCurve(curve){
     g.fillStyle="#9a9a9a"; g.fillText(t, W-pad.r-145, pad.t+i*15-3); });
 }
 
+function setupLine(r){
+  const m=r.metrics||{};
+  const loss=SPEC.loss[sel.mismatch]||"l2";
+  let t=`<b>${sel.deformation.replace(/_/g," ")}</b> <span class="dim">warp</span>`
+      +` &nbsp;&middot;&nbsp; <b>${sel.mismatch.replace(/_/g," ")}</b>`
+      +` <span class="dim">intensity, ${loss} loss</span>`
+      +` &nbsp;&middot;&nbsp; <b>${sel.model}</b>`;
+  if(m.n_parameters!==undefined)
+    t+=` <span class="dim">${m.n_parameters.toLocaleString()} parameters</span>`;
+  if(r.note) t+=`<br><span class="dim">${r.note}</span>`;
+  document.getElementById("setup").innerHTML=t;
+}
 async function poll(){
   const r=await (await fetch("/api/state")).json();
+  setupLine(r);
   document.getElementById("prog").style.width=
     (r.steps ? (r.step/r.steps*100) : 0)+"%";
-  document.getElementById("note").textContent=r.note||"";
+
   if(r.stamp!==LAST){
     LAST=r.stamp;
     drawImg("c_source", r.images.source); drawImg("c_target", r.images.target);
@@ -537,7 +566,10 @@ function stats(r){
     ` &nbsp; folded ${fold}`+
     ` &nbsp;&middot;&nbsp; <b>${m.n_parameters.toLocaleString()}</b> parameters`;
 }
-poll();
+// Open on a running fit rather than an empty page: the default configuration is
+// the one worth seeing first, and it costs one keystroke to stop it.
+setupLine({});
+startRun();
 </script></body></html>
 """
 
@@ -592,6 +624,8 @@ class Handler(BaseHTTPRequestHandler):
                              daemon=True).start()
             return self._send(json.dumps({"ok": True}), "application/json")
         if u.path == "/api/stop":
+            if JOB["running"]:
+                print("[stop] requested", flush=True)
             STOP.set()
             return self._send(json.dumps({"ok": True}), "application/json")
         if u.path == "/api/state":

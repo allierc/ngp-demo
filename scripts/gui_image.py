@@ -187,6 +187,12 @@ def train_job(p, device):
                  f"T2^{int(p['log2_hashmap_size'])} "
                  f"{'auto' if int(p['max_resolution']) <= 0 else int(p['max_resolution'])} "
                  f"{p['interpolation'][:6]}")
+        print(f"[run] L{int(p['n_levels'])} F{int(p['n_features'])} "
+              f"T2^{int(p['log2_hashmap_size'])} b{float(p['per_level_scale'])} "
+              f"{p['interpolation']}/{p['activation']}  {int(p['steps'])} steps, "
+              f"lr {float(p['lr']):.1e}, batch {int(p['batch']):,}  -> "
+              f"{info['n_total']:,} params "
+              f"({info['fraction_of_values']*100:.1f}% of the image)", flush=True)
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
                        curve=[], ladder=ladder, metrics=info,
@@ -249,12 +255,17 @@ def train_job(p, device):
                     "curve": [{"t": q["t"], "psnr": q["psnr"]} for q in JOB["curve"]]})
                 JOB["history"] = JOB["history"][-8:]
     except Exception as e:
+        print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
         with LOCK:
             JOB["note"] = f"{type(e).__name__}: {e}"
     finally:
         with LOCK:
             JOB["running"] = False
             JOB["stamp"] += 1
+            m, done = JOB["metrics"], JOB["step"] >= JOB["steps"] > 0
+        verb = "done " if done else "stopped"
+        print(f"[{verb}] {JOB['seconds']:.1f}s  "
+              + (f"psnr {m['psnr']:.2f} dB" if "psnr" in m else ""), flush=True)
 
 
 # Defaults chosen for this page's own default resolution (downsample 2): L15,
@@ -735,6 +746,8 @@ class Handler(BaseHTTPRequestHandler):
                              daemon=True).start()
             return self._send(json.dumps({"ok": True}), "application/json")
         if u.path == "/api/stop":
+            if JOB["running"]:
+                print("[stop] requested", flush=True)
             STOP.set()
             return self._send(json.dumps({"ok": True}), "application/json")
         if u.path == "/api/clear":
