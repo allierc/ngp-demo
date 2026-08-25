@@ -93,6 +93,13 @@ def check(script: str, port: int) -> bool:
         if left:
             print(f"  {script}: unreplaced placeholders {sorted(set(left))}")
             return False
+        # The explainer is a modal. Without the rule that hides it, it renders
+        # inline and pushes the panels off the page -- which looks exactly like
+        # "clicking run does nothing".
+        if 'class="modal"' in html and ".modal { position:fixed" not in html:
+            print(f"  {script}: modal markup present but the stylesheet that "
+                  "hides it is not")
+            return False
         js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
         path = f"/tmp/_page_{port}.js"
         with open(path, "w") as f:
