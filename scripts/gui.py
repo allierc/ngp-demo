@@ -209,6 +209,8 @@ def train_job(cfg, p, device):
                        images={"source": gray_png(sc["source"]),
                                "target": gray_png(sc["observed"])},
                        grid={}, stamp=JOB["stamp"] + 1)
+        print(f"[images] source and target sent ({w}x{h})", flush=True)
+        first_render = True
 
         opt = torch.optim.Adam(model.parameters(), lr=float(p["lr"]))
         steps = int(p["steps"])
@@ -229,7 +231,7 @@ def train_job(cfg, p, device):
         tgt_p = build_pyramid(sc["observed"], pyr["sigma_px"])
         lvl = -1
         every = max(1, steps // 40)
-        t0 = time.perf_counter()
+        t0 = t0_all = time.perf_counter()
 
         for step in range(steps + 1):
             if STOP.is_set():
@@ -280,6 +282,10 @@ def train_job(cfg, p, device):
                     JOB["images"].update(images)
                     JOB["grid"] = grid
                     JOB["stamp"] += 1
+                if first_render:
+                    first_render = False
+                    print(f"[images] first fit and error map sent at step {step} "
+                          f"({time.perf_counter() - t0_all:.1f}s)", flush=True)
     except Exception as e:                                   # surface, don't swallow
         print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
         with LOCK:
@@ -586,6 +592,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # The page is generated per request and changes whenever the script
+        # does; a cached copy is indistinguishable from a broken one.
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 

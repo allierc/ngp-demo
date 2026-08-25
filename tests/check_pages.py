@@ -23,6 +23,44 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 PAGES = [("scripts/gui.py", 8931), ("scripts/gui_image.py", 8932)]
 
+# A realistic /api/state payload. The empty state exercises none of the drawing
+# code, which is where a page actually breaks.
+POPULATED = r"""
+const PIX = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+          + "AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const STATE = {
+  running: true, step: 40, steps: 1500, seconds: 3.2, stamp: 7, note: "8..512 cells",
+  images: {source: PIX, target: PIX, warped: PIX, epe: PIX, reference: PIX,
+           fit: PIX, error: PIX, levels: PIX},
+  grid: {w: 904, h: 1069, epe_vmax: 3,
+         gt: [[[0,0],[100,0],[200,10]], [[0,0],[0,100]]],
+         fit: [[[0,1],[100,2],[200,12]], [[1,0],[1,100]]]},
+  curve: [{step: 0, loss: 1e-2, epe_fg: 2.0, epe_bg: 3.0, t: 0.0, psnr: 20},
+          {step: 40, loss: 1e-3, epe_fg: 0.5, epe_bg: 1.0, t: 3.2, psnr: 35}],
+  metrics: {psnr: 35.5, loss: 1e-3, loss_kind: "l2", n_parameters: 123456,
+            epe_fg: 0.5, epe_band: 0.8, epe_bg: 1.0, det_min: 0.4,
+            folded: 0, folded_count: 0, jacobian_samples: 107156,
+            n_enc: 100000, n_mlp: 23456, n_total: 123456, n_values: 2899128,
+            fraction_of_values: 0.42, hashed_levels: 4, n_levels: 15,
+            finest_px_per_cell: 1.0, width: 904, height: 1069, channels: 3},
+  ladder: [{level: 0, rx: 16, ry: 16, dense: true, px: 56.5},
+           {level: 1, rx: 512, ry: 512, dense: false, px: 1.77}],
+  blocks: {w: 904, h: 1069, n_levels: 15,
+           blocks: [{x: 0, y: 0, w: 64, h: 64, level: 3, cell_px: 33.5},
+                    {x: 64, y: 0, w: 64, h: 64, level: 9, cell_px: 2.94}]},
+  history: [{label: "L15", params: 123456, psnr: 35.5, seconds: 3.2,
+             curve: [{t: 0, psnr: 20}, {t: 3.2, psnr: 35}]}],
+  info: {n_enc: 100000, n_mlp: 23456, n_total: 123456, n_values: 2899128,
+         fraction_of_values: 0.42, hashed_levels: 4, n_levels: 15,
+         finest_px_per_cell: 1.0, width: 904, height: 1069, channels: 3},
+  pyramid_sigma: 8,
+};
+global.fetch = () => Promise.resolve({json: () => Promise.resolve(STATE)});
+poll().then(() => console.log("  populated poll ok"))
+      .catch(e => { console.error("populated poll threw:", e && e.stack || e);
+                    process.exitCode = 1; });
+"""
+
 STUB = r"""
 // Minimal DOM: every element answers every call, so the page can build itself.
 const noop = () => {};
@@ -115,7 +153,7 @@ def check(script: str, port: int) -> bool:
             # gui.py starts a fit as soon as it opens; assert that it really does.
             f.write(STUB + ("\nglobal.EXPECT_START = true;\n"
                             if "gui.py" in script and "image" not in script else "\n")
-                    + js)
+                    + js + "\n" + POPULATED)
         r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             print(f"  {script}: page script threw\n"
