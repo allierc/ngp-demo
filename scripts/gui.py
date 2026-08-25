@@ -49,11 +49,17 @@ from scripts.run_registration import (_dense_field, _feather, foreground_mask, l
                                       resolve_inherits, sample_points)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Fixed, not per-refresh: an auto-scaled error panel brightens as the fit
+# improves, because the colour tracks that frame's own 99th percentile. 10 px is
+# above the band error of every configuration and below the background, where
+# the ground-truth warp is simply unreachable.
+EPE_LUT_MAX = 10.0
+LEVEL_LUT_MAX = 20
 DISPLAY_H = 460                      # panel height in px; images are sent downsampled
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "grid": {}, "note": "", "stamp": 0,
-       "pyramid_sigma": 0}
+       "pyramid_sigma": 0, "levels": None}
 LOCK = threading.Lock()
 STOP = threading.Event()
 SCENE = {}                           # cached image / masks / ground truth per key
@@ -131,6 +137,46 @@ def get_scene(cfg, dname, xname, device):
 # --------------------------------------------------------------- training
 
 
+@torch.no_grad()
+def level_maps(model, shape, device, px, block_px=64, sub=4):
+    """Which resolution level carries the displacement, per block.
+
+    Same decomposition the image page draws, applied to the deformation instead
+    of the picture: render u with levels 0..k for every k, difference
+    consecutive renders, and the level whose release changes u most in a block
+    is the one doing the work there. Control grids have no levels, so this
+    returns nothing for them and the panel says so.
+    """
+    enc = getattr(getattr(model, "field", None), "encoding", None)
+    if enc is None or not hasattr(enc, "set_level_window"):
+        return None
+    h, w = shape
+    hs, ws = max(8, h // sub), max(8, w // sub)
+    xy = pixel_grid(hs, ws, device)
+    bs = max(2, block_px // sub)
+    prev, deltas = None, []
+    for k in range(enc.n_levels + 1):
+        enc.set_level_window(float(k))
+        out = model(xy).reshape(hs, ws, 2)
+        if prev is not None:
+            deltas.append((out - prev).norm(dim=-1))
+        prev = out
+    enc.set_level_window(float(enc.n_levels))
+    D = torch.stack(deltas)
+    nb = F.avg_pool2d(D[None], bs, stride=bs, ceil_mode=True)[0]
+    dom = nb.argmax(0).cpu().numpy()
+    blocks = []
+    for j in range(dom.shape[0]):
+        for i in range(dom.shape[1]):
+            l = int(dom[j, i])
+            blocks.append({"x": i * block_px, "y": j * block_px,
+                           "w": min(block_px, w - i * block_px),
+                           "h": min(block_px, h - j * block_px),
+                           "level": l,
+                           "cell_px": round(w / enc.resolutions[l][0], 2)})
+    return {"blocks": blocks, "w": w, "h": h, "n_levels": enc.n_levels}
+
+
 def _evaluate(model, sc, device, spacing):
     shape = sc["shape"]
     h, w = shape
@@ -154,13 +200,12 @@ def _evaluate(model, sc, device, spacing):
     }
     un = u.detach().cpu().numpy()
     images = {"warped": gray_png(warped),
-              "epe": cmap_png(epe.cpu().numpy(),
-                              max(1.0, float(np.percentile(epe.cpu().numpy(), 99))))}
+              "epe": cmap_png(epe.cpu().numpy(), EPE_LUT_MAX)}
     grid = {"fit": grid_lines(un, spacing, shape),
             "gt": grid_lines(sc["ugt_dense"].cpu().numpy(), spacing, shape),
             "w": shape[1], "h": shape[0],
             "epe_vmax": max(1.0, float(np.percentile(epe.cpu().numpy(), 99)))}
-    return m, images, grid
+    return m, images, grid, level_maps(model, shape, device, px)
 
 
 def train_job(cfg, p, device):
@@ -271,8 +316,9 @@ def train_job(cfg, p, device):
             sched.step()
 
             if step % every == 0 or step == steps:
-                m, images, grid = _evaluate(model, sc, device, int(p["grid_spacing"]))
+                m, images, grid, lv = _evaluate(model, sc, device, int(p["grid_spacing"]))
                 with LOCK:
+                    JOB["levels"] = lv
                     JOB["step"] = step
                     JOB["seconds"] = time.perf_counter() - t0
                     JOB["curve"].append({"step": step, "loss": photo,
@@ -333,13 +379,15 @@ telling them apart.</p>
     <div class="cap">target &mdash; source warped, then remapped</div></div>
   <div class="panel"><canvas id="c_warp" width="330" height="460"></canvas>
     <div class="cap">source warped by the fit</div></div>
+  <div class="panel"><canvas id="c_levels" width="330" height="460"></canvas>
+    <div class="cap">cells at the scale of the level carrying each block</div></div>
+</div>
+<div id="levlegend" class="note"></div>
+<div class="row" style="margin-top:18px">
   <div class="panel"><canvas id="c_grid" width="330" height="460"></canvas>
     <div class="cap">grid &mdash; <i>ground truth</i> vs <b>fit</b></div></div>
-</div>
-<div class="note" id="note"></div>
-<div class="row" style="margin-top:18px">
   <div class="panel"><canvas id="c_epe" width="330" height="460"></canvas>
-    <div class="cap">endpoint error, px</div></div>
+    <div class="cap">endpoint error &mdash; fixed scale 0&ndash;__EPEMAX__ px</div></div>
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
     <div class="cap">loss and endpoint error against iteration</div></div>
 </div>
@@ -371,7 +419,7 @@ window.addEventListener("unhandledrejection", e =>
 function openAbout(){document.getElementById("about").classList.add("open");}
 function closeAbout(){document.getElementById("about").classList.remove("open");}
 document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
-const SPEC=__SPEC__, KNOBS=__KNOBS__, DEF=__DEF__;
+const SPEC=__SPEC__, KNOBS=__KNOBS__, DEF=__DEF__, LUTMAX=__LUTMAX__;
 const sel={deformation:SPEC.deformation[0], mismatch:SPEC.mismatch[0],
            model:SPEC.model[0]};
 const knob=Object.assign({}, DEF);
@@ -502,6 +550,53 @@ function blit(g,cv,im){
                +`${Math.round(r.width)}x${Math.round(r.height)}`);
 }
 
+// Fixed 0-20 level scale, shared with the image page, so a colour means the
+// same level whatever L is set to.
+function levColor(t){
+  const S=[[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]];
+  const x=Math.max(0,Math.min(1,t))*(S.length-1), i=Math.floor(x), f=x-i;
+  const a=S[i], b=S[Math.min(S.length-1,i+1)];
+  return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},`
+        +`${Math.round(a[2]+(b[2]-a[2])*f)})`;
+}
+function drawLevels(bk){
+  const cv=document.getElementById("c_levels"), g=cv.getContext("2d");
+  g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
+  const leg=document.getElementById("levlegend");
+  if(!bk || !bk.blocks){
+    leg.textContent="a control grid has no levels to decompose"; return; }
+  const im=IMG["c_source"];
+  const s=Math.min(cv.width/bk.w, cv.height/bk.h);
+  const ox=(cv.width-bk.w*s)/2, oy=(cv.height-bk.h*s)/2;
+  if(im){ g.globalAlpha=0.55; g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
+  bk.blocks.forEach(b=>{
+    const col=levColor(b.level/LUTMAX), cw=b.cell_px*s;
+    g.strokeStyle=col; g.lineWidth=0.6; g.globalAlpha=0.85;
+    if(cw<3){ g.fillStyle=col; g.globalAlpha=0.30;
+      g.fillRect(ox+b.x*s, oy+b.y*s, b.w*s, b.h*s); g.globalAlpha=0.85; }
+    else {
+      // Step the GLOBAL lattice and clip to the block, so cells stay evenly
+      // spaced across block boundaries.
+      const c=b.cell_px;
+      for(let x=Math.ceil(b.x/c)*c; x<=b.x+b.w; x+=c){ g.beginPath();
+        g.moveTo(ox+x*s, oy+b.y*s); g.lineTo(ox+x*s, oy+(b.y+b.h)*s); g.stroke(); }
+      for(let y=Math.ceil(b.y/c)*c; y<=b.y+b.h; y+=c){ g.beginPath();
+        g.moveTo(ox+b.x*s, oy+y*s); g.lineTo(ox+(b.x+b.w)*s, oy+y*s); g.stroke(); }
+    }
+    g.globalAlpha=1;
+  });
+  const used=[...new Set(bk.blocks.map(b=>b.level))].sort((a,b)=>a-b);
+  let bar="";
+  for(let i=0;i<=LUTMAX;i++)
+    bar+=`<span style="display:inline-block;width:16px;height:10px;`
+        +`background:${levColor(i/LUTMAX)}"></span>`;
+  leg.innerHTML=`<div>level colour scale, fixed 0&ndash;${LUTMAX}</div>`
+    +`<div style="line-height:0">${bar}</div>`
+    +`<div style="margin-top:5px">carrying the displacement per 64 px block: `
+    + used.map(l=>{ const b=bk.blocks.find(q=>q.level===l);
+        return `<span style="color:${levColor(l/LUTMAX)}">&#9632; ${l} `
+              +`(${b.cell_px} px cells)</span>`; }).join(" &nbsp; ") + "</div>";
+}
 function drawGrid(gr){
   const cv=document.getElementById("c_grid"), g=cv.getContext("2d");
   g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
@@ -576,7 +671,7 @@ async function poll(){
     LAST=r.stamp;
     drawImg("c_source", r.images.source); drawImg("c_target", r.images.target);
     drawImg("c_warp", r.images.warped);   drawImg("c_epe", r.images.epe);
-    drawGrid(r.grid); drawCurve(r.curve); stats(r);
+    drawGrid(r.grid); drawLevels(r.levels); drawCurve(r.curve); stats(r);
   }
   // Only stop once the run has actually been observed running: a not-yet-started
   // job and a finished one look identical from here.
@@ -652,7 +747,9 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__ABOUT__", ABOUT_HTML)
                         .replace("__SPEC__", json.dumps(spec))
                         .replace("__KNOBS__", json.dumps(KNOB_SPEC))
-                        .replace("__DEF__", json.dumps(KNOB_DEFAULTS)))
+                        .replace("__DEF__", json.dumps(KNOB_DEFAULTS))
+                        .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
+                        .replace("__EPEMAX__", f"{EPE_LUT_MAX:g}"))
             return self._send(page, "text/html; charset=utf-8")
         if u.path == "/api/start":
             if JOB["running"]:
