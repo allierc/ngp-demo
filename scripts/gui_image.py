@@ -357,7 +357,7 @@ let LAST=-1, POLL=null, IMG={};
 // Declared up here, not beside the drawing code: the magnifier toggle below is
 // built while the controls are, and a `const` referenced before its declaration
 // is a ReferenceError that kills the whole script rather than one handler.
-const ZOOM={on:false, u:0.5, v:0.5, f:4, refFixed:false};
+const ZOOM={on:false, u:0.5, v:0.5, f:4, refFixed:true};
 const PANELS=["c_ref","c_fit","c_err","c_levels"];
 let LASTBLOCKS=null;
 // White line, with the compression figure carrying the verdict: green under
@@ -400,7 +400,7 @@ seg("downsample", [1,2,4], "downsample");
   const g=document.createElement("div"); g.className="group";
   const l=document.createElement("div"); l.className="label"; l.textContent="magnifier";
   const sg=document.createElement("div"); sg.className="seg";
-  [["all panels",false],["reference fixed",true]].forEach(([txt,val])=>{
+  [["reference fixed",true],["all panels",false]].forEach(([txt,val])=>{
     const b=document.createElement("button"); b.textContent=txt;
     b.setAttribute("aria-pressed", ZOOM.refFixed===val);
     b.onclick=()=>{ ZOOM.refFixed=val;
