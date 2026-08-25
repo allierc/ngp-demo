@@ -40,8 +40,9 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ngp.deform import (apply_mismatch, build_deformation, build_model, field_jacobian,
-                        lncc_loss, patch_offsets, pixel_grid, sample_bilinear, warp_image)
+from ngp.deform import (apply_mismatch, build_deformation, build_model, build_pyramid,
+                        field_jacobian, lncc_loss, patch_offsets, pixel_grid,
+                        pyramid_level, sample_bilinear, warp_image)
 from ngp.utils import psnr
 from ngp.webui import ABOUT_HTML
 from scripts.run_registration import (_dense_field, _feather, foreground_mask, load_image,
@@ -51,7 +52,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DISPLAY_H = 460                      # panel height in px; images are sent downsampled
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
-       "metrics": {}, "images": {}, "grid": {}, "note": "", "stamp": 0}
+       "metrics": {}, "images": {}, "grid": {}, "note": "", "stamp": 0,
+       "pyramid_sigma": 0}
 LOCK = threading.Lock()
 STOP = threading.Event()
 SCENE = {}                           # cached image / masks / ground truth per key
@@ -213,6 +215,15 @@ def train_job(cfg, p, device):
         frac = cfg["training"]["sampling"]["foreground_fraction"]
         reg_n = cfg["training"].get("reg_batch", 8192)
         w_smooth, w_fold = float(p["w_smooth"]), float(p["w_fold"])
+        # Without this the loss has a capture radius of about half the LNCC
+        # window, ~4 px, against ground-truth displacements of 12-42 px, and no
+        # parameterisation can converge. Exposed as a control because it and the
+        # level window are substitutes: with neither, the fit lands 43x worse.
+        pyr = (cfg["training"].get("image_pyramid", {"sigma_px": [0], "switch_at": [0.0]})
+               if int(p.get("pyramid", 1)) else {"sigma_px": [0], "switch_at": [0.0]})
+        src_p = build_pyramid(sc["source"], pyr["sigma_px"])
+        tgt_p = build_pyramid(sc["observed"], pyr["sigma_px"])
+        lvl = -1
         every = max(1, steps // 40)
         t0 = time.perf_counter()
 
@@ -228,9 +239,14 @@ def train_job(cfg, p, device):
                 xy = (c[:, None, :] + offs[None]).reshape(-1, 2)
             else:
                 xy = sample_points(sc["fg_idx"], int(p["batch"]), frac, shape, device)
+            new_lvl = pyramid_level(step, steps, pyr["switch_at"])
+            if new_lvl != lvl:
+                lvl = new_lvl
+                with LOCK:
+                    JOB["pyramid_sigma"] = pyr["sigma_px"][lvl]
             u = model(xy)
-            pred = sample_bilinear(sc["source"], xy + u / px)
-            gt = sample_bilinear(sc["observed"], xy)
+            pred = sample_bilinear(src_p[lvl], xy + u / px)
+            gt = sample_bilinear(tgt_p[lvl], xy)
             loss = (lncc_loss(pred, gt, n_patch) if sc["loss"] == "lncc"
                     else ((pred - gt) ** 2).mean())
             photo = float(loss)
@@ -397,6 +413,19 @@ function group(name, opts, key){
 group("deformation", SPEC.deformation, "deformation");
 group("mismatch", SPEC.mismatch, "mismatch");
 group("parameterisation", SPEC.model, "model");
+(function(){
+  const g=document.createElement("div"); g.className="group";
+  const l=document.createElement("div"); l.className="label";
+  l.textContent="image pyramid";
+  const sg=document.createElement("div"); sg.className="seg";
+  [["on",1],["off",0]].forEach(([txt,val])=>{
+    const b=document.createElement("button"); b.textContent=txt;
+    b.setAttribute("aria-pressed", knob.pyramid===val);
+    b.onclick=()=>{ knob.pyramid=val;
+      [...sg.children].forEach(c=>c.setAttribute("aria-pressed", c===b)); };
+    sg.appendChild(b); });
+  g.append(l,sg); C.appendChild(g);
+})();
 
 function isHash(){ return SPEC.kind[sel.model]==="hash_grid"; }
 function knobPanel(el, title, list){
@@ -551,7 +580,9 @@ function stats(r){
   document.getElementById("stats").innerHTML=
     `iteration <b>${r.step}</b> / ${r.steps} &nbsp;&middot;&nbsp; `+
     `${r.seconds.toFixed(1)} s &nbsp;&middot;&nbsp; `+
-    `${m.loss_kind} loss <b>${m.loss.toExponential(2)}</b><br>`+
+    `${m.loss_kind} loss <b>${m.loss.toExponential(2)}</b>`+
+    (r.pyramid_sigma>0 ? ` &nbsp;&middot;&nbsp; pyramid sigma <b>${r.pyramid_sigma}</b> px` : "")+
+    `<br>`+
     `endpoint error &nbsp; foreground <b>${m.epe_fg.toFixed(3)}</b> px`+
     ` &nbsp; boundary band <b>${m.epe_band.toFixed(3)}</b>`+
     ` &nbsp; background <b>${m.epe_bg.toFixed(3)}</b><br>`+
@@ -664,7 +695,7 @@ KNOB_SPEC = {
 }
 KNOB_DEFAULTS = {k["name"]: k.get("default") for g in KNOB_SPEC.values() for k in g
                  if "default" in k}
-KNOB_DEFAULTS.update(interpolation="smoothstep", coarse_to_fine=1)
+KNOB_DEFAULTS.update(interpolation="smoothstep", coarse_to_fine=1, pyramid=1)
 
 
 def main():
@@ -678,8 +709,16 @@ def main():
         cfg = yaml.safe_load(f)
     Handler.cfg = cfg
     Handler.device = torch.device(a.device)
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
+    except OSError as e:
+        if e.errno == 98:
+            sys.exit(f"port {a.port} is already in use -- either this server is "
+                     f"already running (open http://localhost:{a.port}) or pass "
+                     f"--port with a free one")
+        raise
     print(f"http://localhost:{a.port}   (device {a.device})")
-    ThreadingHTTPServer(("0.0.0.0", a.port), Handler).serve_forever()
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

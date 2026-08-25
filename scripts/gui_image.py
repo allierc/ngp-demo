@@ -768,8 +768,16 @@ def main():
     a = ap.parse_args()
     DEFAULT_IMAGE = a.image
     Handler.device = torch.device(a.device)
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
+    except OSError as e:
+        if e.errno == 98:
+            sys.exit(f"port {a.port} is already in use -- either this server is "
+                     f"already running (open http://localhost:{a.port}) or pass "
+                     f"--port with a free one")
+        raise
     print(f"http://localhost:{a.port}   (device {a.device})")
-    ThreadingHTTPServer(("0.0.0.0", a.port), Handler).serve_forever()
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
