@@ -54,6 +54,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # above the band error of every configuration and below the background, where
 # the ground-truth warp is simply unreachable.
 EPE_LUT_MAX = 10.0
+# The photometric residual on its own fixed scale, in intensity units. Against
+# the CLEAN warp, not the observed one: under a gamma remap the observed target
+# differs in intensity everywhere, and a residual against it would show the
+# remap rather than the misalignment.
+RESID_LUT_MAX = 0.10
 LEVEL_LUT_MAX = 20
 DISPLAY_H = 460                      # panel height in px; images are sent downsampled
 
@@ -223,6 +228,8 @@ def _evaluate(model, sc, device, spacing):
     vmax = max(1.0, float(sc["ugt_dense"].norm(dim=-1).max()))
     images = {"warped": gray_png(warped),
               "epe": cmap_png(epe.cpu().numpy(), EPE_LUT_MAX),
+              "residual": cmap_png((warped - target_clean).abs().cpu().numpy(),
+                                   RESID_LUT_MAX),
               "ufit": flow_png(u.reshape(h, w, 2).cpu().numpy(), vmax)}
     grid = {"fit": grid_lines(un, spacing, shape),
             "gt": grid_lines(sc["ugt_dense"].cpu().numpy(), spacing, shape),
@@ -441,6 +448,8 @@ telling them apart.</p>
       is magnitude</div></div>
   <div class="panel"><canvas id="c_epe" width="330" height="460"></canvas>
     <div class="cap">endpoint error &mdash; fixed scale 0&ndash;__EPEMAX__ px</div></div>
+  <div class="panel"><canvas id="c_resid" width="330" height="460"></canvas>
+    <div class="cap">image residual &mdash; fixed scale 0&ndash;__RESMAX__</div></div>
 </div>
 <div class="row" style="margin-top:18px">
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
@@ -759,7 +768,7 @@ async function poll(){
     LAST=r.stamp;
     drawImg("c_source", r.images.source); drawImg("c_target", r.images.target);
     drawImg("c_warp", r.images.warped);   drawImg("c_epe", r.images.epe);
-    drawImg("c_ufit", r.images.ufit);
+    drawImg("c_ufit", r.images.ufit); drawImg("c_resid", r.images.residual);
     drawGrid(r.grid); drawLevels(r.levels);
     drawCurve(r.curve, r.switches); stats(r);
   }
@@ -842,7 +851,8 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__KNOBS__", json.dumps(KNOB_SPEC))
                         .replace("__DEF__", json.dumps(KNOB_DEFAULTS))
                         .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
-                        .replace("__EPEMAX__", f"{EPE_LUT_MAX:g}"))
+                        .replace("__EPEMAX__", f"{EPE_LUT_MAX:g}")
+                        .replace("__RESMAX__", f"{RESID_LUT_MAX:g}"))
             return self._send(page, "text/html; charset=utf-8")
         if u.path == "/api/start":
             if JOB["running"]:

@@ -49,6 +49,7 @@ from scripts.run_registration import _feather, foreground_mask, load_image, samp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EPE_LUT_MAX = 10.0                  # fixed, so the error panels mean one thing throughout
+RESID_LUT_MAX = 0.10                # the photometric residual, in intensity units
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "note": "", "stamp": 0, "frames": [],
@@ -277,6 +278,12 @@ def evaluate(model, gt, sc, n_frames, device, picks, n_probe=25):
             i = picks.index(int(f))
             warped = warp_model(src, model, shape, t, device)
             images[f"fit{i}"] = gray_png(warped)
+            # what the LOSS sees, as opposed to what the field got wrong: a fit
+            # can match the picture and still have the field wrong wherever the
+            # picture has no gradient
+            tgt = warp_t(src, gt, t, shape)
+            images[f"resid{i}"] = cmap_png((warped - tgt).abs().cpu().numpy(),
+                                           RESID_LUT_MAX)
             images[f"epe{i}"] = cmap_png(epe.reshape(h, w).cpu().numpy(), EPE_LUT_MAX)
             # the field itself, both versions -- everything else on the page is a
             # consequence of the deformation rather than the deformation
@@ -351,6 +358,14 @@ scores every frame so which one is happening is a fact.</p>
     <div class="cap">endpoint error</div></div>
   <div class="panel"><canvas id="c_epe2" width="300" height="380"></canvas>
     <div class="cap">endpoint error</div></div>
+</div>
+<div class="row equal" style="margin-top:8px">
+  <div class="panel"><canvas id="c_resid0" width="300" height="380"></canvas>
+    <div class="cap">image residual &mdash; fixed 0&ndash;0.1</div></div>
+  <div class="panel"><canvas id="c_resid1" width="300" height="380"></canvas>
+    <div class="cap">image residual</div></div>
+  <div class="panel"><canvas id="c_resid2" width="300" height="380"></canvas>
+    <div class="cap">image residual</div></div>
 </div>
 <div class="row equal" style="margin-top:8px">
   <div class="panel"><canvas id="c_lev0" width="300" height="380"></canvas>
@@ -582,6 +597,7 @@ async function poll(){
       drawImg("c_target"+i, r.images["target"+i]);
       drawImg("c_fit"+i, r.images["fit"+i]);
       drawImg("c_epe"+i, r.images["epe"+i]);
+      drawImg("c_resid"+i, r.images["resid"+i]);
       drawLevels("c_lev"+i, (r.levels||{})[String(i)], "c_target"+i);
       drawGrid("c_grid"+i, (r.grids||{})[String(i)]);
       const cap=document.getElementById("cap"+i);
