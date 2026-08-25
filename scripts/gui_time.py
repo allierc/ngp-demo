@@ -44,7 +44,7 @@ from ngp.deform import (MovingBand, build_pyramid, pixel_grid, pyramid_level,
                         sample_bilinear)
 from ngp.model import NGPField
 from ngp.utils import psnr
-from ngp.webui import ABOUT_HTML, CSS, cmap_png, flow_png, gray_png
+from ngp.webui import ABOUT_HTML, CSS, cmap_png, gray_png
 from scripts.run_registration import _feather, foreground_mask, load_image, sample_points
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +52,7 @@ EPE_LUT_MAX = 10.0                  # fixed, so the error panels mean one thing 
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "note": "", "stamp": 0, "frames": [],
-       "per_frame": [], "levels_live": None, "grids": {}}
+       "per_frame": [], "levels_live": None, "grids": {}, "levels": {}}
 LOCK = threading.Lock()
 STOP = threading.Event()
 SCENE: dict = {}
@@ -159,8 +159,8 @@ def train_job(cfg, p, device):
             secs += time.perf_counter() - s0
 
             if step % every == 0 or step == steps:
-                m, images, per_frame, grids = evaluate(model, gt, sc, n_frames,
-                                                       device, picks)
+                m, images, per_frame, grids, levels = evaluate(
+                    model, gt, sc, n_frames, device, picks)
                 with LOCK:
                     JOB["step"] = step
                     JOB["seconds"] = secs
@@ -171,6 +171,7 @@ def train_job(cfg, p, device):
                     JOB["metrics"].update(m)
                     JOB["images"].update(images)
                     JOB["grids"] = grids
+                    JOB["levels"] = levels
                     JOB["stamp"] += 1
     except Exception as e:
         print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
@@ -200,6 +201,51 @@ def dense_u(model, shape, t, device, chunk=1 << 18):
     return torch.cat([model(xyt[i:i + chunk]) for i in range(0, len(xyt), chunk)])
 
 
+@torch.no_grad()
+def level_map_at(model, shape, device, t, block_px=64, sub=4, thresh=0.08):
+    """Per block, the finest level contributing to u at time t.
+
+    The same decomposition the other pages draw, taken on one time slice: render
+    u with levels 0..k enabled for every k, difference consecutive renders, and
+    report per block the finest level whose contribution clears a threshold set
+    inside that block. Watching it across three frames answers whether the
+    encoder's detail follows the band as the band moves.
+    """
+    enc = model.encoding
+    h, w = shape
+    hs, ws = max(8, h // sub), max(8, w // sub)
+    xy = pixel_grid(hs, ws, device)
+    tt = torch.full((xy.shape[0], 1), float(t), device=device)
+    xyt = torch.cat([xy, tt], dim=1)
+    bs = max(2, block_px // sub)
+    prev, deltas = None, []
+    for k in range(enc.n_levels + 1):
+        enc.set_level_window(float(k))
+        out = model(xyt).reshape(hs, ws, 2)
+        if prev is not None:
+            deltas.append((out - prev).norm(dim=-1))
+        prev = out
+    enc.set_level_window(float(enc.n_levels))
+    D = torch.stack(deltas)
+    nb = F.avg_pool2d(D[None], bs, stride=bs, ceil_mode=True)[0]
+    peak = nb.amax(0, keepdim=True)
+    alive = peak > 0.02 * float(nb.max())
+    sig = (nb > thresh * peak) & alive
+    lev = torch.arange(nb.shape[0], device=nb.device)[:, None, None].expand_as(nb)
+    dom = torch.where(sig, lev, torch.zeros_like(lev)).amax(0)
+    dom = torch.where(sig.any(0), dom, nb.argmax(0)).cpu().numpy()
+    blocks = []
+    for j in range(dom.shape[0]):
+        for i in range(dom.shape[1]):
+            l = int(dom[j, i])
+            blocks.append({"x": i * block_px, "y": j * block_px,
+                           "w": min(block_px, w - i * block_px),
+                           "h": min(block_px, h - j * block_px),
+                           "level": l,
+                           "cell_px": round(w / enc.resolutions[l][0], 2)})
+    return {"blocks": blocks, "w": w, "h": h, "n_levels": enc.n_levels}
+
+
 def grid_lines(u, spacing, shape):
     """A regular grid carried through x -> x + u(x), as polylines in image px."""
     h, w = shape
@@ -217,7 +263,7 @@ def evaluate(model, gt, sc, n_frames, device, picks, n_probe=25):
     h, w = shape
     xy = pixel_grid(h, w, device)
     sel = fg.reshape(-1)
-    images, per_frame, grids = {}, [], {}
+    images, per_frame, grids, levels = {}, [], {}, {}
     # every frame is scored, not only the three shown: the whole question is
     # whether the fit holds across time or only where it was pushed hardest
     probe = np.unique(np.linspace(0, n_frames - 1, n_probe).round().astype(int))
@@ -238,14 +284,14 @@ def evaluate(model, gt, sc, n_frames, device, picks, n_probe=25):
             gn = ugt.reshape(h, w, 2).cpu().numpy()
             # exposed for THIS run's motion, so the field is legible whatever
             # the total is set to
-            images[f"ugt{i}"] = flow_png(gn, max(1.0, float(np.abs(gn).max())))
+            levels[str(i)] = level_map_at(model, shape, device, t)
             grids[str(i)] = {"gt": grid_lines(gn, 64, shape),
                              "fit": grid_lines(un, 64, shape), "w": w, "h": h}
     e = np.array([v for _, v in per_frame])
     m = {"epe_mean": float(e.mean()), "epe_max": float(e.max()),
          "epe_first": per_frame[0][1], "epe_last": per_frame[-1][1],
          "epe_mid": per_frame[len(per_frame) // 2][1]}
-    return m, images, per_frame, grids
+    return m, images, per_frame, grids, levels
 
 
 @torch.no_grad()
@@ -307,13 +353,14 @@ scores every frame so which one is happening is a fact.</p>
     <div class="cap">endpoint error</div></div>
 </div>
 <div class="row equal" style="margin-top:8px">
-  <div class="panel"><canvas id="c_ugt0" width="300" height="380"></canvas>
-    <div class="cap">ground-truth field &mdash; hue is direction</div></div>
-  <div class="panel"><canvas id="c_ugt1" width="300" height="380"></canvas>
-    <div class="cap">ground-truth field</div></div>
-  <div class="panel"><canvas id="c_ugt2" width="300" height="380"></canvas>
-    <div class="cap">ground-truth field</div></div>
+  <div class="panel"><canvas id="c_lev0" width="300" height="380"></canvas>
+    <div class="cap">the pyramid in use &mdash; finest level contributing per block</div></div>
+  <div class="panel"><canvas id="c_lev1" width="300" height="380"></canvas>
+    <div class="cap">the pyramid in use</div></div>
+  <div class="panel"><canvas id="c_lev2" width="300" height="380"></canvas>
+    <div class="cap">the pyramid in use</div></div>
 </div>
+<div id="levlegend" class="note"></div>
 <div class="row equal" style="margin-top:8px">
   <div class="panel"><canvas id="c_grid0" width="300" height="380"></canvas>
     <div class="cap">grid &mdash; <i>ground truth</i> vs <b>fit</b></div></div>
@@ -418,6 +465,49 @@ function blit(g,cv,im){
   g.drawImage(im,(cv.width-im.width*s)/2,(cv.height-im.height*s)/2,im.width*s,im.height*s);
 }
 
+function levColor(t){
+  const S=[[77,163,255],[64,224,208],[124,255,90],[255,210,77],[255,107,107]];
+  const x=Math.max(0,Math.min(1,t))*(S.length-1), i=Math.floor(x), f=x-i;
+  const a=S[i], b=S[Math.min(S.length-1,i+1)];
+  return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},`
+        +`${Math.round(a[2]+(b[2]-a[2])*f)})`;
+}
+const LUTMAX=20;
+function drawLevels(id, bk, src){
+  const cv=document.getElementById(id), g=cv.getContext("2d");
+  g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
+  if(!bk||!bk.blocks) return;
+  const s=Math.min(cv.width/bk.w, cv.height/bk.h);
+  const ox=(cv.width-bk.w*s)/2, oy=(cv.height-bk.h*s)/2;
+  const im=IMG[src];
+  if(im){ g.globalAlpha=0.30; g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
+  bk.blocks.forEach(b=>{
+    const col=levColor(b.level/LUTMAX), cw=b.cell_px*s;
+    g.strokeStyle=col; g.lineWidth=1.0; g.globalAlpha=0.95;
+    if(cw<3){ g.fillStyle=col; g.globalAlpha=0.42;
+      g.fillRect(ox+b.x*s, oy+b.y*s, b.w*s, b.h*s); g.globalAlpha=0.95; }
+    else {
+      const c=b.cell_px;
+      for(let x=Math.ceil(b.x/c)*c; x<=b.x+b.w; x+=c){ g.beginPath();
+        g.moveTo(ox+x*s, oy+b.y*s); g.lineTo(ox+x*s, oy+(b.y+b.h)*s); g.stroke(); }
+      for(let y=Math.ceil(b.y/c)*c; y<=b.y+b.h; y+=c){ g.beginPath();
+        g.moveTo(ox+b.x*s, oy+y*s); g.lineTo(ox+(b.x+b.w)*s, oy+y*s); g.stroke(); }
+    }
+    g.globalAlpha=1;
+  });
+  const used=[...new Set(bk.blocks.map(b=>b.level))].sort((a,b)=>a-b);
+  let bar=""; for(let i=0;i<=LUTMAX;i++)
+    bar+=`<span style="display:inline-block;width:14px;height:9px;`
+        +`background:${levColor(i/LUTMAX)}"></span>`;
+  document.getElementById("levlegend").innerHTML=
+    `<div>level colour scale, fixed 0&ndash;${LUTMAX}</div>`
+    +`<div style="line-height:0">${bar}</div>`
+    +`<div style="margin-top:4px">levels contributing at the last frame: `
+    + used.map(l=>{ const b=bk.blocks.find(q=>q.level===l);
+        return `<span style="color:${levColor(l/LUTMAX)}">&#9632; ${l} `
+              +`(${b.cell_px} px cells)</span>`; }).join(" &nbsp; ")
+    +` &nbsp; <span style="color:#7a7a7a">squares are 64 px analysis blocks</span></div>`;
+}
 function drawGrid(id, gr){
   const cv=document.getElementById(id), g=cv.getContext("2d");
   g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
@@ -492,7 +582,7 @@ async function poll(){
       drawImg("c_target"+i, r.images["target"+i]);
       drawImg("c_fit"+i, r.images["fit"+i]);
       drawImg("c_epe"+i, r.images["epe"+i]);
-      drawImg("c_ugt"+i, r.images["ugt"+i]);
+      drawLevels("c_lev"+i, (r.levels||{})[String(i)], "c_target"+i);
       drawGrid("c_grid"+i, (r.grids||{})[String(i)]);
       const cap=document.getElementById("cap"+i);
       if(cap && r.frames && r.frames.length===3)

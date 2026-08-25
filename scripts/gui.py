@@ -218,8 +218,12 @@ def _evaluate(model, sc, device, spacing):
         "jacobian_samples": int(det.numel()),
     }
     un = u.detach().cpu().numpy()
+    # The field the fit has LEARNED, on the ground truth's own scale so the two
+    # are directly comparable: hue is direction, brightness is magnitude.
+    vmax = max(1.0, float(sc["ugt_dense"].norm(dim=-1).max()))
     images = {"warped": gray_png(warped),
-              "epe": cmap_png(epe.cpu().numpy(), EPE_LUT_MAX)}
+              "epe": cmap_png(epe.cpu().numpy(), EPE_LUT_MAX),
+              "ufit": flow_png(u.reshape(h, w, 2).cpu().numpy(), vmax)}
     grid = {"fit": grid_lines(un, spacing, shape),
             "gt": grid_lines(sc["ugt_dense"].cpu().numpy(), spacing, shape),
             "w": shape[1], "h": shape[0],
@@ -289,8 +293,7 @@ def train_job(cfg, p, device):
                                # 12 px shear band shown in a 300 px panel the
                                # consequence is a few screen pixels wide and easy
                                # to miss entirely.
-                               "ugt": flow_png(sc["ugt_dense"].cpu().numpy(),
-                                               EPE_LUT_MAX * 2)},
+},
                        grid={}, stamp=JOB["stamp"] + 1)
         print(f"[images] source and target sent ({w}x{h})", flush=True)
         first_render = True
@@ -430,14 +433,16 @@ telling them apart.</p>
     <div class="cap">finest level contributing in each block &mdash; signal, not scale</div></div>
 </div>
 <div id="levlegend" class="note"></div>
-<div class="row" style="margin-top:18px">
-  <div class="panel"><canvas id="c_ugt" width="330" height="460"></canvas>
-    <div class="cap">the ground-truth field &mdash; hue is direction, brightness
-      is magnitude</div></div>
+<div class="row equal" style="margin-top:18px">
   <div class="panel"><canvas id="c_grid" width="330" height="460"></canvas>
     <div class="cap">grid &mdash; <i>ground truth</i> vs <b>fit</b></div></div>
+  <div class="panel"><canvas id="c_ufit" width="330" height="460"></canvas>
+    <div class="cap">the field the fit learned &mdash; hue is direction, brightness
+      is magnitude</div></div>
   <div class="panel"><canvas id="c_epe" width="330" height="460"></canvas>
     <div class="cap">endpoint error &mdash; fixed scale 0&ndash;__EPEMAX__ px</div></div>
+</div>
+<div class="row" style="margin-top:18px">
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
     <div class="cap">endpoint error against the analytic field, by region</div></div>
 </div>
@@ -754,7 +759,7 @@ async function poll(){
     LAST=r.stamp;
     drawImg("c_source", r.images.source); drawImg("c_target", r.images.target);
     drawImg("c_warp", r.images.warped);   drawImg("c_epe", r.images.epe);
-    drawImg("c_ugt", r.images.ugt);
+    drawImg("c_ufit", r.images.ufit);
     drawGrid(r.grid); drawLevels(r.levels);
     drawCurve(r.curve, r.switches); stats(r);
   }
