@@ -68,12 +68,12 @@ models:
   - name: ngp
     kind: hash_grid
     encoding:
-      n_levels: 14
+      n_levels: 8
       n_features_per_level: 2
-      log2_hashmap_size: 19
+      log2_hashmap_size: 16
       base_resolution: 8
       per_level_scale: 1.5
-      max_resolution: 512
+      max_resolution: 128
       interpolation: smoothstep
     decoder:
       n_neurons: 64
@@ -84,6 +84,16 @@ models:
       enabled: true
       start_levels: 4
       full_at_step: 1500
+  - name: ngp_fine
+    inherits: ngp
+    encoding:
+      n_levels: 14
+      n_features_per_level: 2
+      log2_hashmap_size: 19
+      base_resolution: 8
+      per_level_scale: 1.5
+      max_resolution: 512
+      interpolation: smoothstep
   - name: ngp_no_c2f
     inherits: ngp
     coarse_to_fine:
@@ -97,16 +107,6 @@ models:
       base_resolution: 8
       per_level_scale: 1.5
       max_resolution: 512
-      interpolation: smoothstep
-  - name: ngp_matched
-    inherits: ngp
-    encoding:
-      n_levels: 8
-      n_features_per_level: 2
-      log2_hashmap_size: 16
-      base_resolution: 8
-      per_level_scale: 1.5
-      max_resolution: 128
       interpolation: smoothstep
   - name: tensor_16
     kind: control_grid

@@ -820,11 +820,18 @@ def _isnum(v):
 KNOB_SPEC = {
     "hash": [
         {"name": "n_levels", "label": "levels", "min": 2, "max": 16,
-         "default": 12, "step": 1},
+         "default": 8, "step": 1},
         {"name": "log2_hashmap_size", "label": "log2 hash table size",
          "min": 10, "max": 22, "default": 16, "step": 1},
+        # Capped at the DEFORMATION's scale, not the image's. The finest thing
+        # in these warps is ~23 px (multiscale) or a 12 px shear band, and 128
+        # cells is 7 px per cell. Uncapped at 512 the fit is no better and the
+        # field is far rougher: 34x the parameters, 64x the bending energy, and
+        # a slightly worse endpoint error. The levels below the data's own scale
+        # do not go unused -- they get used indiscriminately, because nothing
+        # tells a fine level to stay out of smooth content.
         {"name": "max_resolution", "label": "finest cells per axis",
-         "min": 16, "max": 1024, "default": 512, "step": 16},
+         "min": 16, "max": 1024, "default": 128, "step": 16},
         {"name": "interpolation"},
         {"name": "coarse_to_fine"},
     ],
