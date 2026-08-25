@@ -148,9 +148,10 @@ async function run(){
   while(PLAY){
     // Skip frames rather than wait for them. Each frame is a fresh chunk read
     // from the bucket at roughly half a second, so the loop is bound by the
-    // network: covering the run in ~30 steps instead of ~300 plays it 10x faster
-    // in wall-clock, at the cost of landing on every 260th frame.
-    const stride=Math.max(1, Math.round(T/30));
+    // network and speed can only come from taking bigger steps: 10 steps across
+    // the run, every ~790th frame. The field is rank 2 over the whole recording,
+    // so the frames in between carry almost nothing the neighbours do not.
+    const stride=Math.max(1, Math.round(T/10));
     FRAME=(FRAME+stride)%T; rng.value=FRAME; val.textContent=FRAME;
     await loadFrame(FRAME);
   }
