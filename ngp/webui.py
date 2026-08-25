@@ -173,50 +173,59 @@ Multiresolution Hash Encoding</i>, SIGGRAPH 2022
 (<a href="https://arxiv.org/abs/2201.05989" target="_blank">arXiv:2201.05989</a>,
 <a href="https://github.com/NVlabs/instant-ngp" target="_blank">NVlabs/instant-ngp</a>).</p>
 
-<h2>The hash table is the whole data structure</h2>
-<p>Each level owns one flat array, of at most <code>T</code> feature vectors.
-Nothing else exists: no tree, no nodes, no pointers, no traversal, no refinement
-bookkeeping. A lookup is an index computation and a gather, O(1), the same for every
-level and every point.</p>
-<p>Whether a level collides is decided by arithmetic, not by a setting. A level of
-resolution <code>r</code> has <code>(r+1)^D</code> nodes. If that fits in
-<code>T</code> the level is indexed <b>directly</b> and stores every node separately.
-If it does not, node coordinates are folded through a spatial hash</p>
+<h2>The table is smaller than the grid, so nodes share entries</h2>
+<p>That one sentence is the whole of it. A level of resolution <code>r</code> has
+<code>(r+1)^D</code> nodes and each node wants its own feature vector, but the level
+is only given a table of <code>T</code> entries. When there are more nodes than
+entries, many nodes must share one.</p>
+<p>Take the finest level of this page's default encoder. It is 657 cells per axis, so
+it has <b>658 x 658 = 432,964 nodes</b>, and its table holds <b>1,024</b> entries.
+So on average <b>423 distinct nodes share each entry</b>: they read the same two
+numbers, and any update one of them makes lands on all of them.</p>
+<p>Which nodes share is decided by a spatial hash of the node's integer
+coordinates,</p>
 <p><code>h(x) = ( XOR_d  x_d * pi_d )  mod  T</code>, &nbsp;
 pi = (1, 2654435761, 805459861, 3674653429)</p>
-<p>and distinct nodes begin <i>sharing</i> entries. This is what decouples cost from
-resolution: a 512-cell-per-axis level in 3D has ~10^8 nodes, which nobody stores, yet
-its table is still <code>T</code> entries, so refining it costs nothing.</p>
+<p>and the point of hashing is that the sharers come out <i>scattered</i>. The 421
+nodes that land on entry 0 of that level have a median separation of 330 px in a
+904 px frame &mdash; they are spread across the picture, not clustered where the
+damage would be visible as a block.</p>
+<p>When a level's nodes <i>do</i> fit in <code>T</code> there is no hash and no
+sharing: the level is indexed directly and stores every node separately. That is the
+normal state of the coarse levels, and it is why the table size does nothing until a
+level outgrows it.</p>
+<p>What this buys is that cost stops following resolution. A 512-cell-per-axis level
+in 3D has ~10^8 nodes, which nobody stores; its table is still <code>T</code>
+entries, so refining a level is free.</p>
 
-<h2>Why collisions are the mechanism and not a defect</h2>
-<p>When two distant nodes hash to the same entry, that entry's features are used
-for both, and in the backward pass it receives the <i>sum</i> of everything asked
-of it. Concretely, for a table entry <code>e</code>:</p>
+<h2>Why sharing is survivable</h2>
+<p>Because the entry is not really shared equally &mdash; it is won.</p>
+<p>In the backward pass an entry <code>e</code> receives the <i>sum</i> of everything
+asked of it:</p>
 <p><code>dL/de = SUM over every sampled point whose cell has a corner mapping to e,
 of  w * dL/df</code></p>
-<p>where <code>w</code> is that corner's interpolation weight for that point and
-<code>dL/df</code> is the gradient arriving from the decoder. Three things scale each
-term, and all three are near zero in the region you do not care about:</p>
+<p>where <code>w</code> is that corner's interpolation weight and <code>dL/df</code>
+is the gradient arriving from the decoder. Three things scale each term:</p>
 <ul>
-<li><b>how many points land there.</b> Sampling is masked to the foreground, so an
-empty region contributes few terms or none at all.</li>
-<li><b>the interpolation weight.</b> A corner far from a query gets a small
-<code>w</code>, so even a point that does touch the cell may barely move it.</li>
-<li><b>the residual.</b> A region the fit already explains sends back almost no
+<li><b>how many points land there</b> &mdash; sampling is masked to the foreground, so
+an empty region contributes few terms or none.</li>
+<li><b>the interpolation weight</b> &mdash; a corner far from a query gets a small
+<code>w</code> and barely moves the entry.</li>
+<li><b>the residual</b> &mdash; a region the fit already explains sends back almost no
 gradient, whatever its sample count.</li>
 </ul>
-<p>So the sum is dominated by whichever colliding node the data actually constrains,
-and the entry converges to the value that node needs while the other simply rides
-along on it. No importance heuristic decides this and no pass detects it; the
-optimiser does it as a side effect of ordinary training. It also self-limits:
-collisions only occur at the fine levels, where each entry is touched by few points,
-while the coarse levels that carry most of the signal are dense and collide with
-nothing.</p>
-<p>The honest failure case is the symmetric one. If both colliding regions are
-<i>equally</i> well constrained, neither term dominates and the entry settles on a
-gradient-weighted compromise that is wrong for both. Nothing detects that either
-&mdash; it shows up as a faint ghost of one region appearing in the other, and the
-fix is a larger table rather than a cleverer rule.</p>
+<p>If most of the 423 sharers sit where there is no data, no residual, or no weight,
+their terms are ~0 and the sum is dominated by the one node the data actually
+constrains. The entry converges to what that node needs and the rest ride along on
+it. No importance heuristic decides this and no pass detects it: the optimiser does
+it as a side effect of ordinary training.</p>
+<p><b>The limit is when that is not true.</b> If every sharer is equally well
+constrained &mdash; a fully textured image with a small table, which is exactly this
+page's default &mdash; no term dominates, the entry settles on a gradient-weighted
+compromise, and the fit pays for it. That is not a bug to be fixed with a cleverer
+rule; it is the table being too small for the data, and the fix is a bigger table or
+a coarser finest level. It is also why the method works so well on a NeRF or on a
+mostly-empty volume: there, most sharers really are in empty space.</p>
 
 <h2>What is free, and what is not</h2>
 <p>An adaptive octree has to be built: decide where to subdivide, maintain the
