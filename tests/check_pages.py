@@ -95,7 +95,15 @@ global.document = {
   querySelectorAll: () => [],
 };
 global.window = global;
-global.Image = class { constructor() { this.width = 330; this.height = 460; } };
+global.addEventListener = noop;      // the page registers unhandledrejection on window
+// Fire onload. Without it the stub never runs blit(), which is the function
+// that actually paints -- so a page could pass the check and still show four
+// black panels in a browser.
+global.Image = class {
+  constructor() { this.width = 389; this.height = 460; this._src = ""; }
+  set src(v) { this._src = v; if (this.onload) this.onload(); }
+  get src() { return this._src; }
+};
 global.CALLS = [];
 global.fetch = (u) => { global.CALLS.push(String(u));
   return Promise.resolve({json: () => Promise.resolve({

@@ -359,6 +359,17 @@ on quality against time and against parameter count.</p>
 <div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
   <div class="sheet">__ABOUT__</div></div>
 </div><script>
+// A page that fails in the browser but passes every offline check leaves no
+// trace at all: the panels are simply black. Report the exception to the server
+// so it lands in the terminal next to [run] and [images].
+function _report(what){
+  try { fetch("/api/clienterror?msg=" + encodeURIComponent(String(what).slice(0, 800))); }
+  catch (e) {}
+}
+window.onerror = (msg, src, line, col, err) =>
+  _report((err && err.stack) || (msg + " @" + line + ":" + col));
+window.addEventListener("unhandledrejection", e =>
+  _report("unhandled rejection: " + ((e.reason && e.reason.stack) || e.reason)));
 function openAbout(){document.getElementById("about").classList.add("open");}
 function closeAbout(){document.getElementById("about").classList.remove("open");}
 document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
@@ -747,6 +758,9 @@ class Handler(BaseHTTPRequestHandler):
             STOP.clear()
             threading.Thread(target=train_job, args=(_params(q), self.device),
                              daemon=True).start()
+            return self._send(json.dumps({"ok": True}), "application/json")
+        if u.path == "/api/clienterror":
+            print(f"[client] {q.get('msg', '')}", flush=True)
             return self._send(json.dumps({"ok": True}), "application/json")
         if u.path == "/api/stop":
             if JOB["running"]:
