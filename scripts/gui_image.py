@@ -123,7 +123,7 @@ def describe(model, shape):
 
 
 @torch.no_grad()
-def level_maps(model, shape, device, block_px=64, sub=3):
+def level_maps(model, shape, device, block_px=64, sub=3, thresh=0.08):
     """Where each resolution level does its work.
 
     Renders the image with levels 0..k enabled for every k and differences
@@ -160,8 +160,27 @@ def level_maps(model, shape, device, block_px=64, sub=3):
     lev = torch.arange(D.shape[0], device=D.device, dtype=D.dtype)
     eff = (D * lev[:, None, None]).sum(0) / D.sum(0).clamp(min=1e-9)
 
-    nb = F.avg_pool2d(D[None], bs, stride=bs, ceil_mode=True)[0]
-    dom = nb.argmax(0).cpu().numpy()                          # (Hb, Wb)
+    nb = F.avg_pool2d(D[None], bs, stride=bs, ceil_mode=True)[0]      # (L, Hb, Wb)
+    # THE FINEST LEVEL THAT IS DOING WORK, not the one doing the most. argmax
+    # reports whichever level carries the largest displacement, and in any field
+    # with a smooth component that is a coarse level everywhere -- measured on the
+    # multiscale bands, the finest band reported the coarsest cells. The question
+    # the panel asks is how finely the encoding is resolving this neighbourhood,
+    # so it is the finest level whose contribution clears a threshold set from the
+    # field itself.
+    # THRESHOLD PER BLOCK, not globally. A global threshold asks "is this level
+    # loud compared with the whole frame", so a region whose displacement is
+    # small never clears it however finely structured it is -- measured on the
+    # multiscale bands, the finest band (23 px features, but the lowest
+    # amplitude) reported coarser cells than the band beside it. Normalising
+    # inside the block asks the question the panel is for: of the levels doing
+    # anything HERE, which is the finest.
+    peak = nb.amax(0, keepdim=True)
+    alive = peak > 0.02 * float(nb.max())          # a block with no displacement has no scale
+    sig = (nb > thresh * peak) & alive
+    lev = torch.arange(nb.shape[0], device=nb.device)[:, None, None].expand_as(nb)
+    dom = torch.where(sig, lev, torch.zeros_like(lev)).amax(0)
+    dom = torch.where(sig.any(0), dom, nb.argmax(0)).cpu().numpy()
     blocks = []
     for j in range(dom.shape[0]):
         for i in range(dom.shape[1]):
@@ -339,7 +358,7 @@ on quality against time and against parameter count.</p>
   <div class="panel"><canvas id="c_err" width="330" height="460"></canvas>
     <div class="cap">absolute error &mdash; fixed scale 0&ndash;__ERRMAX__</div></div>
   <div class="panel"><canvas id="c_levels" width="330" height="460"></canvas>
-    <div class="cap">cells at the scale of the level dominating each block</div></div>
+    <div class="cap">finest level contributing in each block &mdash; signal, not scale</div></div>
 </div>
 <div id="zoomnote" class="note"></div>
 <div id="levlegend" class="note"></div>
@@ -631,7 +650,8 @@ function drawLevels(bk){
     `<div style="margin-bottom:2px">level colour scale, fixed 0&ndash;${LUTMAX}`
     +` &nbsp; (applies to the grid and to the effective-level map)</div>`
     +`<div style="line-height:0">${bar}</div><div>${ticks}</div>`
-    +`<div style="margin-top:5px">dominant level per 64 px block in this fit: `
+    +`<div style="margin-top:5px">levels contributing (blank regions have no `
+    +`scale; levels do not specialise by frequency): `
     + used.map(l=>{
         const b=bk.blocks.find(q=>q.level===l);
         return `<span style="color:${levColor(l/LUTMAX)}">&#9632; ${l} `

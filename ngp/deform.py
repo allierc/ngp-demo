@@ -204,6 +204,73 @@ class GaussianBumps:
         return self.scale * self._raw(xy)
 
 
+class MultiScaleBands:
+    """Displacement whose spatial SCALE varies across the frame, at constant amplitude.
+
+    Every other ground truth here has one characteristic scale everywhere, so a
+    level decomposition of the fit has nothing to report: whichever level matches
+    that scale carries the whole field. This one is built in vertical bands whose
+    Gaussian width falls geometrically from left to right while their peak
+    displacement stays the same, so the *frequency* varies and the amplitude does
+    not. A hash grid that allocates by scale should then use visibly coarser cells
+    on the left than on the right -- and if it does not, the claim that it puts
+    capacity where the data needs it is not doing any work here.
+    """
+
+    def __init__(self, n_bands=4, sigma_px=(128.0, 16.0), max_displacement_px=8.0,
+                 per_band=8, shape=(1069, 904), seed=0, device="cpu"):
+        g = torch.Generator().manual_seed(seed + 303)
+        h, w = shape
+        cs, sg, dr, bid = [], [], [], []
+        self.n_bands = n_bands
+        for b in range(n_bands):
+            f = b / max(1, n_bands - 1)
+            sig = sigma_px[0] * (sigma_px[1] / sigma_px[0]) ** f     # geometric: one step finer per band
+            # MORE BUMPS WHERE THEY ARE SMALLER. With a fixed count per band, a
+            # narrow bump covers a fraction of the band's area and the mean
+            # displacement there falls with sigma -- 15x across four bands when
+            # measured. The level decomposition weights by how much a level moves
+            # the field, so the fine bands would barely register and the panel
+            # would be reporting amplitude again instead of scale.
+            n_b = int(round(per_band * sigma_px[0] / sig))
+            x0, x1 = b / n_bands, (b + 1) / n_bands
+            cx = x0 + (x1 - x0) * torch.rand(n_b, generator=g)
+            cy = torch.rand(n_b, generator=g)
+            cs.append(torch.stack([cx, cy], 1))
+            sg.append(torch.stack([torch.full((n_b,), sig / w),
+                                   torch.full((n_b,), sig / h)], 1))
+            d = torch.randn(n_b, 2, generator=g)
+            dr.append(d / d.norm(dim=1, keepdim=True))
+            bid.append(torch.full((n_b,), b))
+        self.c = torch.cat(cs).to(device)
+        self.sig = torch.cat(sg).to(device)
+        self.d = torch.cat(dr).to(device)
+        self.band = torch.cat(bid).to(device)
+        self.amp = torch.ones(self.c.shape[0], device=device)
+        self.scale = 1.0
+        # EQUAL PEAK PER BAND, so the only thing that varies across the frame is
+        # the scale. Measured per band on a probe grid rather than assumed,
+        # because overlapping wide bumps reach a higher peak than isolated
+        # narrow ones at the same per-bump amplitude.
+        probe = _probe(device)
+        px = torch.tensor([w, h], device=device, dtype=torch.float32)
+        for b in range(n_bands):
+            keep = (self.band == b).float()
+            u = (torch.exp(-0.5 * (((probe[:, None, :] - self.c[None]) / self.sig[None]) ** 2
+                                   ).sum(-1)) * (self.amp * keep)[None]) @ self.d
+            peak = float(u.norm(dim=1).max())
+            if peak > 0:
+                self.amp = torch.where(self.band == b, self.amp / peak, self.amp)
+        self.scale = float(max_displacement_px
+                           / self._raw(probe).norm(dim=1).max())
+    def _raw(self, xy):
+        r2 = (((xy[:, None, :] - self.c[None]) / self.sig[None]) ** 2).sum(-1)
+        return (torch.exp(-0.5 * r2) * self.amp[None]) @ self.d
+
+    def __call__(self, xy):
+        return self.scale * self._raw(xy)
+
+
 class ShearBand:
     """A near-discontinuity: displacement parallel to a band, flipping across it."""
 
@@ -257,6 +324,11 @@ def build_deformation(spec: dict, built: dict, shape, device, seed=0, foreground
         return GaussianBumps(spec.get("n_bumps", 6), tuple(spec.get("sigma_px", (30, 80))),
                              spec.get("max_displacement_px", 20.0), shape, centres,
                              seed, device)
+    if kind == "multiscale_bands":
+        return MultiScaleBands(spec.get("n_bands", 4),
+                               tuple(spec.get("sigma_px", (128.0, 16.0))),
+                               spec.get("max_displacement_px", 8.0),
+                               spec.get("per_band", 8), shape, seed, device)
     if kind == "shear_band":
         centre = (0.5, 0.5)
         if spec.get("placement") == "foreground" and foreground is not None:

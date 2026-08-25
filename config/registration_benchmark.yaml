@@ -35,6 +35,12 @@ deformations:
   - name: global_plus_local
     type: sum
     terms: [global_smooth, local_bending]
+  - name: multiscale
+    type: multiscale_bands
+    n_bands: 4
+    sigma_px: [128.0, 16.0]
+    per_band: 8
+    max_displacement_px: 8
   - name: slip_band
     type: shear_band
     angle_deg: 35

@@ -186,6 +186,33 @@ conclusions, are worth naming because they are easy to repeat:
    model comparison; it was the objective. An image pyramid took the hash grid
    from 11.59 to 1.27 px endpoint error and the control grid from 8.68 to 1.47.
 
+### The levels do not specialise by frequency
+
+A hash grid is often described as putting its fine levels where the fine
+structure is. It does not, and `tests/level_specialisation.py` is the standing
+check. Fit the encoder by plain regression -- no registration loss, no
+regulariser -- to a field that is smooth on its left half and 10x finer on its
+right at equal amplitude, and measure each level's contribution on each half:
+
+| cells per axis | left (smooth) | right (fine) | ratio |
+|---|---|---|---|
+| 8 | 0.0285 | 0.0165 | 0.58 |
+| 52 | 0.0378 | 0.0349 | 0.92 |
+| 134 | 0.0269 | 0.0286 | 1.06 |
+| 344 | 0.0075 | 0.0086 | 1.14 |
+
+The 344-cell level does as much work on the smooth side as on the fine side.
+Nothing in the architecture would do otherwise: every level is queried
+everywhere, the levels are summed into one feature vector, and a fine level
+represents a smooth function perfectly well by varying its entries slowly.
+
+What *is* true is narrower: entries only move where samples touch them, so a
+region with no data costs nothing. A level map therefore separates signal from
+no-signal -- on the painting, the black surround from the face -- and says
+nothing about the local scale of the structure. If capacity belongs at a
+particular scale, cap the finest level there. That is what stage 4 measured:
+34x fewer parameters, lower endpoint error and 64x less bending energy.
+
 ## What this encoder does that tiny-cuda-nn's does not
 
 * Runs anywhere torch runs — no `nvcc`, no build. It is slower than the fused CUDA
