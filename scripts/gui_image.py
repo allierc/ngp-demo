@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ngp import NGPField
 from ngp.utils import BilinearImage, pixel_centers, psnr, read_image, render
-from ngp.webui import ABOUT_HTML, CSS, cmap_png, gray_png
+from ngp.webui import ABOUT_HTML, CSS, INTERFACE_IMAGE, cmap_png, gray_png
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_IMAGE = os.path.join(ROOT, "assets/girl_with_a_pearl_earring.jpg")
@@ -339,7 +339,7 @@ parameters, barely moves PSNR, and turns up later as noise in every derivative
 taken through the fit. Finished runs stay on the curve, so settings can be compared
 on quality against time and against parameter count.</p>
 <div class="controls"><div class="group"><div class="label">&nbsp;</div>
-  <div class="seg"><button onclick="openAbout()">what is an ngp?</button></div>
+  <div class="seg"><button onclick="openAbout()">what is an ngp?</button><button onclick="openHelp()">what is this interface?</button></div>
 </div></div>
 <div class="controls" id="controls"></div>
 <div class="knobs" id="knobs_enc"></div>
@@ -377,6 +377,9 @@ on quality against time and against parameter count.</p>
 <div class="stats" id="stats"></div>
 <div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
   <div class="sheet">__ABOUT__</div></div>
+<div class="modal" id="help" onclick="if(event.target===this)closeHelp()">
+  <div class="sheet"><button class="close" onclick="closeHelp()">close</button>
+  __HELP__</div></div>
 </div><script>
 // A page that fails in the browser but passes every offline check leaves no
 // trace at all: the panels are simply black. Report the exception to the server
@@ -391,7 +394,10 @@ window.addEventListener("unhandledrejection", e =>
   _report("unhandled rejection: " + ((e.reason && e.reason.stack) || e.reason)));
 function openAbout(){document.getElementById("about").classList.add("open");}
 function closeAbout(){document.getElementById("about").classList.remove("open");}
-document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
+function openHelp(){document.getElementById("help").classList.add("open");}
+function closeHelp(){document.getElementById("help").classList.remove("open");}
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){ closeAbout(); closeHelp(); }});
 const KNOBS=__KNOBS__, TRAIN=__TRAIN__, DEF=__DEF__, LUTMAX=__LUTMAX__;
 const knob=Object.assign({}, DEF);
 let LAST=-1, POLL=null, IMG={}, SEEN_RUNNING=false;
@@ -757,6 +763,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in ("/", "/index.html"):
             page = (PAGE.replace("__CSS__", CSS)
                         .replace("__ABOUT__", ABOUT_HTML)
+                        .replace("__HELP__", INTERFACE_IMAGE)
                         .replace("__KNOBS__", json.dumps(KNOBS))
                         .replace("__TRAIN__", json.dumps(TRAIN_KNOBS))
                         .replace("__DEF__", json.dumps(DEFAULTS))

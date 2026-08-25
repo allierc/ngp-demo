@@ -235,3 +235,141 @@ parameters and higher PSNR than leaving it uncapped: 5.92M / 40.28 dB against
 7.66M / 39.54 dB.</li>
 </ul>
 """
+
+
+# What every control on each page does. Separate from ABOUT_HTML, which explains
+# the method: a reader who knows what a hash grid is still cannot guess what
+# "displacement scale" or "level window" is wired to here.
+INTERFACE_COMMON = """
+<h2>Reading the run</h2>
+<ul>
+<li>The terminal prints <code>[run]</code> with the configuration, <code>[images]</code>
+when the first frames go out, and <code>[done]</code> or <code>[stopped]</code> with the
+final numbers. If the page looks empty and those lines are there, the problem is in the
+browser, not the fit.</li>
+<li><b>run / stop</b> -- stop leaves the fit where it is and reports it, rather than
+discarding it.</li>
+</ul>
+
+<h2>Training</h2>
+<ul>
+<li><b>learning rate</b> -- Adam's step, log-spaced. The hash table tolerates 1e-2
+comfortably; a dense control grid wants roughly 5x that, because each of its parameters
+sees far more of the image.</li>
+<li><b>iterations</b> -- how long, with a cosine decay to 3% of the starting rate. The
+schedules that depend on it (level window, image pyramid) are expressed as fractions of
+this, so changing it rescales them rather than truncating them.</li>
+<li><b>batch size</b> -- sample points per step, drawn 90% inside the foreground mask and
+10% uniformly. This is the knob that makes an empty background cost nothing: the points
+are where the compute goes.</li>
+</ul>
+"""
+
+INTERFACE_IMAGE = INTERFACE_COMMON + """
+<h2>The encoding</h2>
+<ul>
+<li><b>levels L</b> and <b>growth b</b> -- the ladder of resolutions,
+<code>N_l = N_min * b^l</code>. Watch the ladder table: two levels that land on the same
+lattice are wasted, since they are separate feature sets on identical nodes.</li>
+<li><b>features per level F</b> -- width per scale. Doubling it doubles the table.</li>
+<li><b>log2 table size T</b> -- where collisions begin. A level whose nodes fit in T is
+stored densely and never collides; the ladder marks which are which.</li>
+<li><b>coarsest / finest cells per axis</b> -- the ends of the ladder. Finest at 0 means
+the image's own pixel count. Going finer than the pixel spacing buys almost no PSNR,
+costs parameters, and shows up as noise in any derivative of the fit.</li>
+<li><b>decoder width / hidden layers</b> -- the MLP that turns the concatenated features
+into RGB. Small on purpose: the table is meant to carry the signal.</li>
+<li><b>interpolation</b> -- linear is the paper's default and only C0. Smoothstep
+(3w^2-2w^3) makes the encoding C1, which you need if anything downstream takes a second
+derivative.</li>
+<li><b>decoder activation</b> -- relu matches the paper; gelu and softplus are smooth,
+which matters for the same reason as smoothstep.</li>
+<li><b>loss</b> -- relative L2 is instant-NGP's, and weights dark pixels up by dividing
+by the prediction's own magnitude. Plain l2 does not.</li>
+<li><b>downsample</b> -- 1, 2 or 4. It changes the reference the compression figure is
+measured against, so the same encoder reads four times larger at downsample 2.</li>
+</ul>
+
+<h2>The panels</h2>
+<ul>
+<li><b>reference / fit / absolute error</b> -- error is on a fixed 0-0.1 scale, so it
+darkens as the fit improves rather than rescaling itself.</li>
+<li><b>finest level contributing</b> -- per 64 px block, the finest level whose
+contribution clears 8% of that block's strongest. It separates regions that carry signal
+from regions that do not. It is <i>not</i> a map of local spatial scale: the levels do
+not specialise by frequency, which is measured in
+<code>tests/level_specialisation.py</code>.</li>
+<li><b>psnr against training time</b> -- finished runs stay, colour-keyed to the table
+below, so settings compare on quality against time and parameters.</li>
+<li><b>magnifier</b> -- hover to magnify; with <i>reference fixed</i> the first panel
+stays whole and marks the region the others show. Scroll changes the factor.</li>
+</ul>
+"""
+
+INTERFACE_REG = INTERFACE_COMMON + """
+<h2>The problem</h2>
+<ul>
+<li><b>deformation</b> -- the analytic warp applied to the source to make the target, so
+the error of a fit is measured against a known field. <code>global smooth</code> is a few
+low Fourier modes; <code>local bending</code> is compact Gaussian bumps;
+<code>multiscale</code> runs four vertical bands from 132 px to 23 px features at equal
+amplitude; <code>slip band</code> is a 12 px shear the smooth parameterisations cannot
+represent.</li>
+<li><b>mismatch</b> -- how unlike the two "modalities" are. <code>matched</code> is
+identical intensities and an L2 loss. <code>gamma noise</code> applies a gamma remap plus
+Poisson-Gaussian noise and switches the loss to patch LNCC, because matching intensities
+no longer means matching tissue.</li>
+<li><b>parameterisation</b> -- what represents the displacement. <code>ngp</code> is the
+hash grid capped at the deformation's own scale; <code>ngp fine</code> is the uncapped
+version kept for comparison; <code>tensor N</code> is a dense NxN control grid,
+bilinearly interpolated, which is the classical parameterisation.</li>
+<li><b>image pyramid</b> -- blurs both images from sigma 16 down to 0 over the first 60%
+of the run. Registration by intensity is a local search, and without this the loss has a
+capture radius of a few pixels against displacements of 12-42: neither model converges.
+The dashed lines on the curve mark the switches.</li>
+</ul>
+
+<h2>The model</h2>
+<ul>
+<li><b>levels</b> and <b>finest cells per axis</b> -- the ladder. The cap is the important
+one: set it at the finest structure the deformation contains, not at the image
+resolution. At 128 cells here that is 7 px per cell against a 12-23 px finest feature;
+uncapped at 512 the fit is no better, uses 34x the parameters, and the field is 64x
+rougher.</li>
+<li><b>interpolation</b> -- smoothstep, because the folding penalty differentiates the
+Jacobian and a linear interpolant's second derivative is identically zero.</li>
+<li><b>coarse to fine (level window)</b> -- <i>on</i> starts with 4 of the levels live
+and ramps to all of them by half-way, multiplying each level's features by
+<code>clamp(alpha - l, 0, 1)</code>; the stats line shows the count as it climbs. It stops
+the optimiser fitting fine detail into a misaligned pose. Without an image pyramid it is
+worth 43x in endpoint error (0.115 px against 4.950, which also folds); with one it is
+redundant, because the pyramid supplies the same thing through the data.</li>
+<li><b>control points per axis</b> -- the control grid's only knob, for the
+<code>tensor</code> models.</li>
+<li><b>smoothness weight</b> -- penalises the field's first derivative.
+<b>folding penalty weight</b> -- penalises a Jacobian determinant heading through zero,
+which is a warp turning itself inside out. Both are set per loss kind, because the L2 and
+LNCC data terms differ by ~1000x and one absolute weight would leave the cross-modal arm
+effectively unregularised.</li>
+<li><b>displacement scale</b> -- the pixel scale the model's raw output is multiplied by.
+Set it above the largest displacement you expect.</li>
+<li><b>overlay grid spacing</b> -- cosmetic; the spacing of the warped grid drawn in the
+ground-truth-vs-fit panel.</li>
+</ul>
+
+<h2>The panels</h2>
+<ul>
+<li><b>endpoint error</b> -- per pixel, the distance between the displacement recovered
+and the true one, in pixels, on a fixed 0-10 scale.</li>
+<li><b>grid</b> -- a regular grid carried through the warp: ground truth in red, the fit
+in blue dashes. Where they coincide, the field is right.</li>
+<li><b>finest level contributing</b> -- as on the image page, and with the same caveat:
+signal versus none, not local scale.</li>
+<li><b>the curve</b> -- endpoint error by region only. The training loss is deliberately
+not plotted: it is measured against whichever pyramid level is current, so it jumps two
+orders of magnitude at a switch while the fit is improving.</li>
+<li>The <b>background</b> curve sits near the ground-truth displacement magnitude and
+stays there. Nothing constrains the warp in a region with no image content, so that line
+reports how much warp exists where no data can reach it.</li>
+</ul>
+"""

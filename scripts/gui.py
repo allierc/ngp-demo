@@ -44,7 +44,7 @@ from ngp.deform import (apply_mismatch, build_deformation, build_model, build_py
                         field_jacobian, lncc_loss, patch_offsets, pixel_grid,
                         pyramid_level, sample_bilinear, warp_image)
 from ngp.utils import psnr
-from ngp.webui import ABOUT_HTML, CSS
+from ngp.webui import ABOUT_HTML, CSS, INTERFACE_REG
 from scripts.run_registration import (_dense_field, _feather, foreground_mask, load_image,
                                       resolve_inherits, sample_points)
 
@@ -59,7 +59,7 @@ DISPLAY_H = 460                      # panel height in px; images are sent downs
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "grid": {}, "note": "", "stamp": 0,
-       "pyramid_sigma": 0, "levels": None, "switches": []}
+       "pyramid_sigma": 0, "levels": None, "switches": [], "levels_live": None}
 LOCK = threading.Lock()
 STOP = threading.Event()
 SCENE = {}                           # cached image / masks / ground truth per key
@@ -257,9 +257,20 @@ def train_job(cfg, p, device):
         n_a, n_b = model.n_parameters()
         is_hash = spec["kind"] == "hash_grid"
         enc = model.field.encoding if is_hash else None
+        n_lv_total = enc.n_levels if is_hash else 0
+        if is_hash:
+            n_hashed = sum(1 for d in enc.dense if not d)
+            finest_nodes = (enc.resolutions[-1][0] + 1) * (enc.resolutions[-1][1] + 1)
+            # A level is stored densely whenever its nodes fit in the table, so a
+            # table larger than the finest level is an upper bound that never
+            # binds and moving it changes nothing. Worth saying, because the
+            # slider then looks broken.
+            inert = ("" if n_hashed else
+                     f"; table not binding -- the finest level has "
+                     f"{finest_nodes:,} nodes and every level fits densely")
         note = (f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells, "
                 f"{sum(1 for d in enc.dense if not d)}/{enc.n_levels} levels hashed, "
-                f"{w / enc.resolutions[-1][0]:.1f} px per finest cell" if is_hash
+                f"{w / enc.resolutions[-1][0]:.1f} px per finest cell{inert}" if is_hash
                 else f"{spec['grid'][0]}x{spec['grid'][1]} control points, "
                      f"{w / spec['grid'][1]:.0f} px apart")
 
@@ -269,7 +280,8 @@ def train_job(cfg, p, device):
               f"{'on' if int(p.get('pyramid', 1)) else 'off'}", flush=True)
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
-                       curve=[], metrics={"n_parameters": n_a + n_b}, note=note,
+                       curve=[], metrics={"n_parameters": n_a + n_b,
+                                          "n_levels_total": n_lv_total}, note=note,
                        images={"source": gray_png(sc["source"]),
                                "target": gray_png(sc["observed"])},
                        grid={}, stamp=JOB["stamp"] + 1)
@@ -307,6 +319,9 @@ def train_job(cfg, p, device):
                 a = 4 + (enc.n_levels - 4) * min(
                     1.0, step / spec["coarse_to_fine"]["full_at_step"])
                 enc.set_level_window(a)
+                JOB["levels_live"] = round(float(a), 2)
+            elif is_hash:
+                JOB["levels_live"] = float(enc.n_levels)
             if sc["loss"] == "lncc":
                 c = sample_points(sc["fg_idx"], n_patch, frac, shape, device)
                 xy = (c[:, None, :] + offs[None]).reshape(-1, 2)
@@ -344,9 +359,12 @@ def train_job(cfg, p, device):
                     JOB["step"] = step
                     JOB["seconds"] = time.perf_counter() - t0
                     JOB["curve"].append({"step": step, "loss": photo,
-                                         "epe_fg": m["epe_fg"], "epe_bg": m["epe_bg"]})
+                                         "epe_fg": m["epe_fg"],
+                                         "epe_band": m["epe_band"],
+                                         "epe_bg": m["epe_bg"]})
                     JOB["metrics"] = {**m, "n_parameters": n_a + n_b, "loss": photo,
-                                      "loss_kind": sc["loss"]}
+                                      "loss_kind": sc["loss"],
+                                      "n_levels_total": n_lv_total}
                     JOB["images"].update(images)
                     JOB["grid"] = grid
                     JOB["stamp"] += 1
@@ -384,7 +402,7 @@ background where nothing constrains the warp, and the band between &mdash; that 
 is where the two parameterisations disagree, long after the warped image stops
 telling them apart.</p>
 <div class="controls"><div class="group"><div class="label">&nbsp;</div>
-  <div class="seg"><button onclick="openAbout()">what is an ngp?</button></div>
+  <div class="seg"><button onclick="openAbout()">what is an ngp?</button><button onclick="openHelp()">what is this interface?</button></div>
 </div></div>
 <div class="controls" id="controls"></div>
 <div class="knobs" id="knobs_model"></div>
@@ -411,12 +429,14 @@ telling them apart.</p>
   <div class="panel"><canvas id="c_epe" width="330" height="460"></canvas>
     <div class="cap">endpoint error &mdash; fixed scale 0&ndash;__EPEMAX__ px</div></div>
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
-    <div class="cap">loss (against the current pyramid level) and endpoint
-      error (against the analytic field)</div></div>
+    <div class="cap">endpoint error against the analytic field, by region</div></div>
 </div>
 <div class="stats" id="stats"></div>
 <div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
   <div class="sheet">__ABOUT__</div></div>
+<div class="modal" id="help" onclick="if(event.target===this)closeHelp()">
+  <div class="sheet"><button class="close" onclick="closeHelp()">close</button>
+  __HELP__</div></div>
 </div><script>
 // A page that fails in the browser but passes every offline check leaves no
 // trace at all: the panels are simply black. Report the exception to the server
@@ -441,7 +461,10 @@ window.addEventListener("unhandledrejection", e =>
   _report("unhandled rejection: " + ((e.reason && e.reason.stack) || e.reason)));
 function openAbout(){document.getElementById("about").classList.add("open");}
 function closeAbout(){document.getElementById("about").classList.remove("open");}
-document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
+function openHelp(){document.getElementById("help").classList.add("open");}
+function closeHelp(){document.getElementById("help").classList.remove("open");}
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){ closeAbout(); closeHelp(); }});
 const SPEC=__SPEC__, KNOBS=__KNOBS__, DEF=__DEF__, LUTMAX=__LUTMAX__;
 const sel={deformation:SPEC.deformation[0], mismatch:SPEC.mismatch[0],
            model:SPEC.model[0]};
@@ -650,7 +673,11 @@ function drawCurve(curve, switches){
   const pad={l:56,r:14,t:16,b:34};
   const xs=curve.map(c=>c.step);
   const x0=Math.min(...xs), x1=Math.max(...xs)||1;
-  const vals=curve.flatMap(c=>[c.loss,c.epe_fg,c.epe_bg]).filter(v=>v>0);
+  // Endpoint error only. The loss is measured against whichever pyramid level
+  // is current, so it jumps by two orders of magnitude at a switch while the fit
+  // is improving -- on the same axes as a metric that means one thing throughout,
+  // it only confuses.
+  const vals=curve.flatMap(c=>[c.epe_fg,c.epe_band,c.epe_bg]).filter(v=>v>0);
   const lo=Math.max(1e-8, Math.min(...vals)), hi=Math.max(...vals);
   const X=v=>pad.l+(v-x0)/((x1-x0)||1)*(W-pad.l-pad.r);
   const Y=v=>pad.t+(1-(Math.log10(Math.max(v,lo))-Math.log10(lo))/
@@ -678,11 +705,12 @@ function drawCurve(curve, switches){
     g.fillStyle="#7a7a7a"; g.font="9px sans-serif"; g.textAlign="center";
     g.fillText(`\u03c3 ${sw.sigma}`, X_, pad.t-3); g.textAlign="left";
   });
-  line("loss","#e8e8e8"); line("epe_fg","#4da3ff"); line("epe_bg","#e5a23c");
+  line("epe_fg","#4da3ff"); line("epe_band","#cf6bd6"); line("epe_bg","#e5a23c");
   g.fillStyle="#8a8a8a"; g.font="11px sans-serif";
   g.fillText("iteration", W/2-22, H-10);
-  [["loss","#e8e8e8"],["epe foreground (px)","#4da3ff"],
-   ["epe background (px)","#e5a23c"]].forEach(([t,c],i)=>{
+  [["endpoint error, foreground (px)","#4da3ff"],
+   ["boundary band (px)","#cf6bd6"],
+   ["background (px)","#e5a23c"]].forEach(([t,c],i)=>{
     g.fillStyle=c; g.fillRect(W-pad.r-160, pad.t+i*15-8, 9, 2);
     g.fillStyle="#9a9a9a"; g.fillText(t, W-pad.r-145, pad.t+i*15-3); });
 }
@@ -732,6 +760,8 @@ function stats(r){
     `${r.seconds.toFixed(1)} s &nbsp;&middot;&nbsp; `+
     `${m.loss_kind} loss <b>${m.loss.toExponential(2)}</b>`+
     (r.pyramid_sigma>0 ? ` &nbsp;&middot;&nbsp; pyramid sigma <b>${r.pyramid_sigma}</b> px` : "")+
+    (r.levels_live!==null ? ` &nbsp;&middot;&nbsp; levels live <b>${r.levels_live}</b>`
+                            +` of ${m.n_levels_total||""}` : "")+
     `<br>`+
     `endpoint error &nbsp; foreground <b>${m.epe_fg.toFixed(3)}</b> px`+
     ` &nbsp; boundary band <b>${m.epe_band.toFixed(3)}</b>`+
@@ -787,6 +817,7 @@ class Handler(BaseHTTPRequestHandler):
                             for k in ("l2", "lncc")}}
             page = (PAGE.replace("__CSS__", CSS)
                         .replace("__ABOUT__", ABOUT_HTML)
+                        .replace("__HELP__", INTERFACE_REG)
                         .replace("__SPEC__", json.dumps(spec))
                         .replace("__KNOBS__", json.dumps(KNOB_SPEC))
                         .replace("__DEF__", json.dumps(KNOB_DEFAULTS))
@@ -839,8 +870,6 @@ KNOB_SPEC = {
     "hash": [
         {"name": "n_levels", "label": "levels", "min": 2, "max": 16,
          "default": 8, "step": 1},
-        {"name": "log2_hashmap_size", "label": "log2 hash table size",
-         "min": 10, "max": 22, "default": 16, "step": 1},
         # Capped at the DEFORMATION's scale, not the image's. The finest thing
         # in these warps is ~23 px (multiscale) or a 12 px shear band, and 128
         # cells is 7 px per cell. Uncapped at 512 the fit is no better and the
@@ -849,7 +878,7 @@ KNOB_SPEC = {
         # do not go unused -- they get used indiscriminately, because nothing
         # tells a fine level to stay out of smooth content.
         {"name": "max_resolution", "label": "finest cells per axis",
-         "min": 16, "max": 1024, "default": 128, "step": 16},
+         "min": 16, "max": 128, "default": 128, "step": 16},
         {"name": "interpolation"},
         {"name": "coarse_to_fine"},
     ],
@@ -876,7 +905,12 @@ KNOB_SPEC = {
 }
 KNOB_DEFAULTS = {k["name"]: k.get("default") for g in KNOB_SPEC.values() for k in g
                  if "default" in k}
-KNOB_DEFAULTS.update(interpolation="smoothstep", coarse_to_fine=1, pyramid=1)
+# Not a slider: with the finest level at 128 cells in 2D, every level fits
+# densely in any table above 2^15 and the size is an upper bound that never
+# binds. It stays in the config, and in 3D -- 128^3 is 2M nodes -- it becomes the
+# knob that decides everything.
+KNOB_DEFAULTS.update(interpolation="smoothstep", coarse_to_fine=1, pyramid=1,
+                     log2_hashmap_size=16)
 
 
 def main():
