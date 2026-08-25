@@ -553,7 +553,10 @@ function blit(g,cv,im){
 // Fixed 0-20 level scale, shared with the image page, so a colour means the
 // same level whatever L is set to.
 function levColor(t){
-  const S=[[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]];
+  // Bright at both ends: viridis' dark end is invisible on a dark image, and the
+  // coarse levels -- the ones that carry most of a smooth deformation -- live
+  // there. Blue, turquoise, green, amber, red instead.
+  const S=[[77,163,255],[64,224,208],[124,255,90],[255,210,77],[255,107,107]];
   const x=Math.max(0,Math.min(1,t))*(S.length-1), i=Math.floor(x), f=x-i;
   const a=S[i], b=S[Math.min(S.length-1,i+1)];
   return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},`
@@ -568,11 +571,12 @@ function drawLevels(bk){
   const im=IMG["c_source"];
   const s=Math.min(cv.width/bk.w, cv.height/bk.h);
   const ox=(cv.width-bk.w*s)/2, oy=(cv.height-bk.h*s)/2;
-  if(im){ g.globalAlpha=0.55; g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
+  if(im){ g.globalAlpha=0.30;   // the grid is the subject here, not the picture
+          g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
   bk.blocks.forEach(b=>{
     const col=levColor(b.level/LUTMAX), cw=b.cell_px*s;
-    g.strokeStyle=col; g.lineWidth=0.6; g.globalAlpha=0.85;
-    if(cw<3){ g.fillStyle=col; g.globalAlpha=0.30;
+    g.strokeStyle=col; g.lineWidth=1.0; g.globalAlpha=0.95;
+    if(cw<3){ g.fillStyle=col; g.globalAlpha=0.42;
       g.fillRect(ox+b.x*s, oy+b.y*s, b.w*s, b.h*s); g.globalAlpha=0.85; }
     else {
       // Step the GLOBAL lattice and clip to the block, so cells stay evenly

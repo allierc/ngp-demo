@@ -13,6 +13,7 @@ import io
 
 import matplotlib
 import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
 import torch
 from PIL import Image
 
@@ -36,10 +37,18 @@ def gray_png(t: torch.Tensor, max_h: int = DISPLAY_H) -> str:
     return png_data_uri((a * 255).astype(np.uint8), max_h)
 
 
+# The level ramp, shared with the pages' levColor(): bright at both ends, so the
+# coarse levels are visible against a dark image and the legend means the same
+# thing in the overlay and in the map.
+LEVEL_RAMP = LinearSegmentedColormap.from_list(
+    "levels", [(0.30, 0.64, 1.00), (0.25, 0.88, 0.82), (0.49, 1.00, 0.35),
+               (1.00, 0.82, 0.30), (1.00, 0.42, 0.42)])
+
+
 def cmap_png(a: np.ndarray, vmax: float, name="inferno", max_h: int = DISPLAY_H) -> str:
     x = np.clip(a / max(vmax, 1e-6), 0, 1)
-    return png_data_uri((matplotlib.colormaps[name](x)[..., :3] * 255).astype(np.uint8),
-                        max_h)
+    cmap = LEVEL_RAMP if name == "levels" else matplotlib.colormaps[name]
+    return png_data_uri((cmap(x)[..., :3] * 255).astype(np.uint8), max_h)
 
 
 CSS = """

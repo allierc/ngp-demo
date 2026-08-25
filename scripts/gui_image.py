@@ -243,7 +243,7 @@ def train_job(p, device):
                     JOB["stamp"] += 1
                 eff, blocks = level_maps(model, shape, device)
                 with LOCK:
-                    JOB["images"]["levels"] = cmap_png(eff, LEVEL_LUT_MAX, "viridis")
+                    JOB["images"]["levels"] = cmap_png(eff, LEVEL_LUT_MAX, "levels")
                     JOB["blocks"] = {"blocks": blocks, "w": w, "h": h,
                                      "n_levels": len(ladder)}
                     JOB["stamp"] += 1
@@ -576,7 +576,10 @@ const HCOL=["#4da3ff","#e5a23c","#2ea043","#cf6bd6","#e5484d","#6bd6c9",
             "#9aa4b2","#d6c96b"];
 // viridis-ish ramp: coarse levels dark blue, fine levels yellow
 function levColor(t){
-  const S=[[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]];
+  // Bright at both ends: viridis' dark end is invisible on a dark image, and the
+  // coarse levels -- the ones that carry most of a smooth deformation -- live
+  // there. Blue, turquoise, green, amber, red instead.
+  const S=[[77,163,255],[64,224,208],[124,255,90],[255,210,77],[255,107,107]];
   const x=Math.max(0,Math.min(1,t))*(S.length-1), i=Math.floor(x), f=x-i;
   const a=S[i], b=S[Math.min(S.length-1,i+1)];
   return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},`
@@ -590,7 +593,8 @@ function drawLevels(bk){
     "run a fit to see the level decomposition"; return; }
   const im=IMG["c_ref"];
   const v=view(cv, bk.w, bk.h); const s=v.s, ox=v.ox, oy=v.oy;
-  if(im){ g.globalAlpha=0.55; g.imageSmoothingEnabled=!ZOOM.on;
+  if(im){ g.globalAlpha=0.30;   // the grid is the subject here, not the picture
+          g.imageSmoothingEnabled=!ZOOM.on;
           g.drawImage(im,ox,oy,bk.w*s,bk.h*s); g.globalAlpha=1; }
   const maxl=LUTMAX;
   bk.blocks.forEach(b=>{
@@ -598,9 +602,9 @@ function drawLevels(bk){
     // Cells finer than ~3 screen px would be a solid wash: tint the block
     // instead, so "too fine to draw" still reads as "very fine".
     const cw=b.cell_px*s;
-    g.strokeStyle=col; g.lineWidth=0.6; g.globalAlpha=0.85;
+    g.strokeStyle=col; g.lineWidth=1.0; g.globalAlpha=0.95;
     if(cw < 3){
-      g.fillStyle=col; g.globalAlpha=0.30;
+      g.fillStyle=col; g.globalAlpha=0.42;
       g.fillRect(ox+b.x*s, oy+b.y*s, b.w*s, b.h*s); g.globalAlpha=0.85;
     } else {
       // Step along the GLOBAL cell lattice and clip to the block. Starting each
