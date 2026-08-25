@@ -298,14 +298,14 @@ def train_job(p, device):
 # The same encoder against the full-resolution image reads ~4x smaller, which
 # is why fit_image.py's defaults differ.
 KNOBS = [
-    {"name": "n_levels", "label": "levels L", "min": 2, "max": 20, "default": 15,
+    {"name": "n_levels", "label": "levels L", "min": 2, "max": 20, "default": 18,
      "step": 1},
     {"name": "n_features", "label": "features per level F", "min": 1, "max": 8,
      "default": 2, "step": 1},
     {"name": "log2_hashmap_size", "label": "log2 table size T", "min": 10,
-     "max": 24, "default": 16, "step": 1},
+     "max": 24, "default": 10, "step": 1},
     {"name": "base_resolution", "label": "coarsest cells per axis", "min": 2,
-     "max": 256, "default": 129, "step": 1},
+     "max": 256, "default": 4, "step": 1},
     {"name": "per_level_scale", "label": "growth per level b", "min": 1.1,
      "max": 2.0, "default": 1.35, "step": 0.05},
     {"name": "max_resolution", "label": "finest cells per axis (0 = the pixel count)",
@@ -324,7 +324,7 @@ TRAIN_KNOBS = [
      "max": 1048576, "default": 262144, "step": 4096},
 ]
 DEFAULTS = {k["name"]: k["default"] for k in KNOBS + TRAIN_KNOBS}
-DEFAULTS.update(interpolation="linear", activation="relu", loss="relative_l2",
+DEFAULTS.update(interpolation="linear", activation="relu", loss="l2",
                 downsample=2)
 
 
