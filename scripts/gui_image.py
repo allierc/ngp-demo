@@ -305,7 +305,7 @@ KNOBS = [
     {"name": "log2_hashmap_size", "label": "log2 table size T", "min": 10,
      "max": 24, "default": 17, "step": 1},
     {"name": "base_resolution", "label": "coarsest cells per axis", "min": 2,
-     "max": 64, "default": 16, "step": 1},
+     "max": 256, "default": 16, "step": 1},
     {"name": "per_level_scale", "label": "growth per level b", "min": 1.1,
      "max": 2.0, "default": 1.35, "step": 0.05},
     {"name": "max_resolution", "label": "finest cells per axis (0 = the pixel count)",
