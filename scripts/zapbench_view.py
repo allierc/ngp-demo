@@ -122,7 +122,7 @@ move the slider to travel through the run.</p>
 <div class="stats" id="stats"></div>
 </div><script>
 let PTS=null, VAL=null, N=0, T=1, ROT={x:-0.35,y:0.6}, ZOOM=1.25, DRAG=null;
-let MODE="mag", FRAME=0, VMAX=1, BUSY=false, SCALE=16, PLAY=false;
+let MODE="mag", FRAME=0, VMAX=1, BUSY=false, SCALE=32, PLAY=false;
 // Advances by a stride so the whole run plays in a few hundred steps, and awaits
 // each frame rather than firing on a timer, so it self-throttles to the network.
 async function run(){
@@ -151,7 +151,7 @@ function seg(name, opts, cur, cb){
 }
 seg("colour by", [["|u|","mag"],["c0","0"],["c1","1"],["c2","2"]], "mag",
     v=>{ MODE=v; loadFrame(FRAME); });
-seg("scale (voxels)", [["8",8],["16",16],["32",32],["64",64]], 16,
+seg("scale (voxels)", [["8",8],["16",16],["32",32],["64",64]], 32,
     v=>{ SCALE=v; loadFrame(FRAME); });
 seg("", [["play",1],["pause",0]], 0, v=>{ PLAY=!!v; if(PLAY) run(); });
 
