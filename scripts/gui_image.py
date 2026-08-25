@@ -354,6 +354,12 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape")closeAbout();});
 const KNOBS=__KNOBS__, TRAIN=__TRAIN__, DEF=__DEF__, LUTMAX=__LUTMAX__;
 const knob=Object.assign({}, DEF);
 let LAST=-1, POLL=null, IMG={};
+// Declared up here, not beside the drawing code: the magnifier toggle below is
+// built while the controls are, and a `const` referenced before its declaration
+// is a ReferenceError that kills the whole script rather than one handler.
+const ZOOM={on:false, u:0.5, v:0.5, f:4, refFixed:false};
+const PANELS=["c_ref","c_fit","c_err","c_levels"];
+let LASTBLOCKS=null;
 // White line, with the compression figure carrying the verdict: green under
 // 50% of the image's own values, amber under 100%, red once the "compression"
 // is an expansion.
@@ -453,8 +459,10 @@ function drawLadder(ladder, info){
       +`<td>${L.rx} &times; ${L.ry}</td><td>${L.px.toFixed(2)}</td>`
       +`<td>${L.dense?'dense':'hashed'}</td></tr>`; });
   h+="</table>";
-  if(info) h+=`<div class="note">${info.n_enc.toLocaleString()} table + `
-             +`${info.n_mlp.toLocaleString()} decoder parameters</div>`;
+  // metrics is {} until the first run, so check the field and not the object.
+  if(info && info.n_enc!==undefined)
+    h+=`<div class="note">${info.n_enc.toLocaleString()} table + `
+      +`${info.n_mlp.toLocaleString()} decoder parameters</div>`;
   document.getElementById("ladder").innerHTML=h;
 }
 
@@ -469,7 +477,6 @@ document.getElementById("clear").onclick=async()=>{ await fetch("/api/clear"); p
 // One shared view for every panel: hovering any of them magnifies all of them
 // about the same point, so the fit, the error and the level grid can be read
 // against each other at the same place rather than eyeballed across panels.
-const ZOOM={on:false, u:0.5, v:0.5, f:4, refFixed:false};
 function view(cv, iw, ih){
   const s0=Math.min(cv.width/iw, cv.height/ih);
   // With "reference fixed" the first panel stays whole and acts as a navigator;
@@ -479,7 +486,6 @@ function view(cv, iw, ih){
   const s=s0*ZOOM.f;
   return {s, ox:cv.width/2-ZOOM.u*iw*s, oy:cv.height/2-ZOOM.v*ih*s, s0};
 }
-const PANELS=["c_ref","c_fit","c_err","c_levels"];
 function redrawAll(){
   PANELS.forEach(id=>{ if(id==="c_levels") drawLevels(LASTBLOCKS);
                        else if(IMG[id]) blit(document.getElementById(id).getContext("2d"),
@@ -554,7 +560,6 @@ function levColor(t){
   return `rgb(${Math.round(a[0]+(b[0]-a[0])*f)},${Math.round(a[1]+(b[1]-a[1])*f)},`
         +`${Math.round(a[2]+(b[2]-a[2])*f)})`;
 }
-let LASTBLOCKS=null;
 function drawLevels(bk){
   bk = bk || LASTBLOCKS; LASTBLOCKS = bk;
   const cv=document.getElementById("c_levels"), g=cv.getContext("2d");
