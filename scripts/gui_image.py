@@ -513,11 +513,13 @@ function drawLadder(ladder, info){
   document.getElementById("ladder").innerHTML=h;
 }
 
-document.getElementById("run").onclick=async()=>{
+async function startRun(){
+  SEEN_RUNNING=false;
   await fetch("/api/start?"+new URLSearchParams(knob));
   if(POLL) clearInterval(POLL);
   POLL=setInterval(poll, 400); poll();
-};
+}
+document.getElementById("run").onclick=startRun;
 document.getElementById("stop").onclick=()=>fetch("/api/stop");
 document.getElementById("clear").onclick=async()=>{ await fetch("/api/clear"); poll(); };
 
@@ -736,6 +738,9 @@ async function poll(){
   if(SEEN_RUNNING && !r.running && POLL){ clearInterval(POLL); POLL=null; }
 }
 zoomNote(); preview(); poll();
+// Open on a running fit rather than an empty page: the default configuration is
+// the one worth seeing first, and stopping it costs one click.
+startRun();
 </script></body></html>
 """
 

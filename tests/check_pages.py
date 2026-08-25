@@ -159,9 +159,8 @@ def check(script: str, port: int) -> bool:
         path = f"/tmp/_page_{port}.js"
         with open(path, "w") as f:
             # gui.py starts a fit as soon as it opens; assert that it really does.
-            f.write(STUB + ("\nglobal.EXPECT_START = true;\n"
-                            if "gui.py" in script and "image" not in script else "\n")
-                    + js + "\n" + POPULATED)
+            # both pages open on a running fit
+            f.write(STUB + "\nglobal.EXPECT_START = true;\n" + js + "\n" + POPULATED)
         r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             print(f"  {script}: page script threw\n"
