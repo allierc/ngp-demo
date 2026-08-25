@@ -89,12 +89,31 @@ def build(stride: int):
     print("[ready] " + STATE["note"], flush=True)
 
 
+FRAMES: "collections.OrderedDict" = None
+
+
 def frame(t: int):
-    """Per-point displacement at time t: magnitude, and the three components."""
+    """Per-point displacement at time t: magnitude, and the three components.
+
+    Cached, because playback revisits the same frames on every pass and each miss
+    is a chunk read from the bucket -- about half a second, which is what bounds
+    the frame rate.
+    """
+    global FRAMES
+    import collections
+    if FRAMES is None:
+        FRAMES = collections.OrderedDict()
+    t = int(t)
+    if t in FRAMES:
+        FRAMES.move_to_end(t)
+        return FRAMES[t]
     flow, idx = CACHE["flow"], CACHE["idx"]
-    a = flow[:, :, :, :, int(t)].read().result().reshape(3, -1)[:, idx]   # (3, N)
-    mag = np.linalg.norm(a, axis=0)
-    return a, mag
+    a = flow[:, :, :, :, t].read().result().reshape(3, -1)[:, idx]        # (3, N)
+    out = (a, np.linalg.norm(a, axis=0))
+    FRAMES[t] = out
+    while len(FRAMES) > 96:                       # ~96 x 3 x 83k floats = 95 MB
+        FRAMES.popitem(last=False)
+    return out
 
 
 def b64(a: np.ndarray) -> str:
@@ -127,7 +146,11 @@ let MODE="mag", FRAME=0, VMAX=1, BUSY=false, SCALE=32, PLAY=false;
 // each frame rather than firing on a timer, so it self-throttles to the network.
 async function run(){
   while(PLAY){
-    const stride=Math.max(1, Math.round(T/300));
+    // Skip frames rather than wait for them. Each frame is a fresh chunk read
+    // from the bucket at roughly half a second, so the loop is bound by the
+    // network: covering the run in ~30 steps instead of ~300 plays it 10x faster
+    // in wall-clock, at the cost of landing on every 260th frame.
+    const stride=Math.max(1, Math.round(T/30));
     FRAME=(FRAME+stride)%T; rng.value=FRAME; val.textContent=FRAME;
     await loadFrame(FRAME);
   }

@@ -75,10 +75,18 @@ Two measurements from that volume, both made here:
   background where the flow is extrapolated, which is the case for sampling a
   representation rather than storing a dense grid.
 * Inside the mask and across the whole 7,879-frame run, the time-varying field
-  is **two spatial modes to 0.56 voxels RMS** (97.9% of the energy), three to
-  0.43, and flat after that -- 40 modes only reach 0.158. Mean displacement in
-  the mask is 11.7 voxels. So a dense 4D grid stores ~250,000 numbers per frame
-  to carry a few numbers' worth of new information per frame.
+  is **two spatial modes to 0.56 RMS** (97.9% of the energy), three to 0.43, and
+  flat after that -- 40 modes only reach 0.158, against a mean displacement of
+  11.7. A rank-3 model of the masked field is 1.0 M numbers against the stored
+  9.0e9, or **8,887x smaller**. Reproduce with `python scripts/zapbench_modes.py`,
+  and `--consecutive` for the aliasing control.
+
+Those errors are in the flow array's own units, which are **undocumented**:
+`raw` and `segmentation` declare 406 x 406 x 4000 nm and `flow_fields` declares
+nothing, so a mean of 11.7 is either 4.75 um or 16x that. Calibrating against
+the raw data does not work, because `raw` is already aligned -- the measured
+shift between frames 7,000 apart is under 0.01 voxel, so no residual motion
+remains for the flow field to explain.
 
 ## Install
 
