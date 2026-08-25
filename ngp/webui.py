@@ -51,6 +51,25 @@ def cmap_png(a: np.ndarray, vmax: float, name="inferno", max_h: int = DISPLAY_H)
     return png_data_uri((cmap(x)[..., :3] * 255).astype(np.uint8), max_h)
 
 
+def flow_png(u: np.ndarray, vmax: float, max_h: int = DISPLAY_H) -> str:
+    """A displacement field as the optical-flow colour wheel: hue is direction,
+    brightness is magnitude.
+
+    A magnitude map alone is blind to the most interesting cases. A shear band
+    displaces two half-planes by equal and opposite amounts, so |u| is uniform
+    and the map is flat -- the thing that makes it a shear is entirely in the
+    direction, which this shows as two opposed hues meeting at a line.
+
+    u: (H, W, 2) in pixels.
+    """
+    import colorsys
+    ang = (np.arctan2(u[..., 1], u[..., 0]) / (2 * np.pi)) % 1.0
+    mag = np.clip(np.linalg.norm(u, axis=-1) / max(vmax, 1e-6), 0, 1)
+    hsv = np.stack([ang, np.ones_like(mag), mag], -1).reshape(-1, 3)
+    rgb = np.array([colorsys.hsv_to_rgb(*c) for c in hsv]).reshape(*u.shape[:2], 3)
+    return png_data_uri((rgb * 255).astype(np.uint8), max_h)
+
+
 CSS = """
   :root { --fg:#fff; --bg:#000; --dim:#9a9a9a; --red:#e5484d; --blue:#4da3ff;
           --amber:#e5a23c; }

@@ -44,7 +44,7 @@ from ngp.deform import (RigidMotion, build_pyramid, field_jacobian, pixel_grid,
                         pyramid_level, sample_bilinear)
 from ngp.model import NGPField
 from ngp.utils import psnr
-from ngp.webui import ABOUT_HTML, CSS, cmap_png, gray_png
+from ngp.webui import ABOUT_HTML, CSS, cmap_png, flow_png, gray_png
 from scripts.run_registration import _feather, foreground_mask, load_image, sample_points
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +52,7 @@ EPE_LUT_MAX = 10.0                  # fixed, so the error panels mean one thing 
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "note": "", "stamp": 0, "frames": [],
-       "per_frame": [], "levels_live": None}
+       "per_frame": [], "levels_live": None, "grids": {}}
 LOCK = threading.Lock()
 STOP = threading.Event()
 SCENE: dict = {}
@@ -79,7 +79,7 @@ def train_job(cfg, p, device):
         h, w = shape
         px = torch.tensor([w, h], device=device, dtype=torch.float32)
         n_frames = int(p["frames"])
-        gt = RigidMotion(p["motion"], float(p["speed"]), n_frames, shape, device=device)
+        gt = RigidMotion(p["motion"], float(p["total"]), n_frames, shape, device=device)
 
         torch.manual_seed(0)
         model = NGPField(
@@ -97,8 +97,8 @@ def train_job(cfg, p, device):
         enc = model.encoding
         n_enc, n_mlp = model.n_parameters()
         unit = "px" if p["motion"] == "translation" else "deg"
-        note = (f"{n_frames} frames, {p['motion']} at {float(p['speed']):.3g} {unit}/frame "
-                f"-> {gt.total():.1f} {unit} total; "
+        note = (f"{n_frames} frames, {p['motion']} of {gt.total():.1f} {unit} in total "
+                f"= {gt.speed:.4g} {unit}/frame; "
                 f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells in space, "
                 f"{enc.resolutions[-1][2]} in time; {n_enc + n_mlp:,} parameters")
         picks = [0, n_frames // 2, n_frames - 1]
@@ -156,7 +156,8 @@ def train_job(cfg, p, device):
             secs += time.perf_counter() - s0
 
             if step % every == 0 or step == steps:
-                m, images, per_frame = evaluate(model, gt, sc, n_frames, device, picks)
+                m, images, per_frame, grids = evaluate(model, gt, sc, n_frames,
+                                                       device, picks)
                 with LOCK:
                     JOB["step"] = step
                     JOB["seconds"] = secs
@@ -166,6 +167,7 @@ def train_job(cfg, p, device):
                     JOB["per_frame"] = per_frame
                     JOB["metrics"].update(m)
                     JOB["images"].update(images)
+                    JOB["grids"] = grids
                     JOB["stamp"] += 1
     except Exception as e:
         print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
@@ -208,12 +210,24 @@ def dense_u(model, shape, t, device, chunk=1 << 18):
     return torch.cat([model(xyt[i:i + chunk]) for i in range(0, len(xyt), chunk)])
 
 
+def grid_lines(u, spacing, shape):
+    """A regular grid carried through x -> x + u(x), as polylines in image px."""
+    h, w = shape
+    ys, xs = np.arange(0, h, spacing), np.arange(0, w, spacing)
+    out = []
+    for y in ys:
+        out.append([(float(x + u[y, x, 0]), float(y + u[y, x, 1])) for x in xs])
+    for x in xs:
+        out.append([(float(x + u[y, x, 0]), float(y + u[y, x, 1])) for y in ys])
+    return out
+
+
 def evaluate(model, gt, sc, n_frames, device, picks, n_probe=25):
     src, shape, fg = sc["source"], sc["shape"], sc["fg"]
     h, w = shape
     xy = pixel_grid(h, w, device)
     sel = fg.reshape(-1)
-    images, per_frame = {}, []
+    images, per_frame, grids = {}, [], {}
     # every frame is scored, not only the three shown: the whole question is
     # whether the fit holds across time or only where it was pushed hardest
     probe = np.unique(np.linspace(0, n_frames - 1, n_probe).round().astype(int))
@@ -228,11 +242,20 @@ def evaluate(model, gt, sc, n_frames, device, picks, n_probe=25):
             warped = warp_model(src, model, shape, t, device)
             images[f"fit{i}"] = gray_png(warped)
             images[f"epe{i}"] = cmap_png(epe.reshape(h, w).cpu().numpy(), EPE_LUT_MAX)
+            # the field itself, both versions -- everything else on the page is a
+            # consequence of the deformation rather than the deformation
+            un = u.reshape(h, w, 2).cpu().numpy()
+            gn = ugt.reshape(h, w, 2).cpu().numpy()
+            # exposed for THIS run's motion, so the field is legible whatever
+            # the total is set to
+            images[f"ugt{i}"] = flow_png(gn, max(1.0, float(np.abs(gn).max())))
+            grids[str(i)] = {"gt": grid_lines(gn, 64, shape),
+                             "fit": grid_lines(un, 64, shape), "w": w, "h": h}
     e = np.array([v for _, v in per_frame])
     m = {"epe_mean": float(e.mean()), "epe_max": float(e.max()),
          "epe_first": per_frame[0][1], "epe_last": per_frame[-1][1],
          "epe_mid": per_frame[len(per_frame) // 2][1]}
-    return m, images, per_frame
+    return m, images, per_frame, grids
 
 
 @torch.no_grad()
@@ -290,6 +313,22 @@ scores every frame so which one is happening is a fact.</p>
     <div class="cap">endpoint error</div></div>
   <div class="panel"><canvas id="c_epe2" width="300" height="380"></canvas>
     <div class="cap">endpoint error</div></div>
+</div>
+<div class="row equal" style="margin-top:8px">
+  <div class="panel"><canvas id="c_ugt0" width="300" height="380"></canvas>
+    <div class="cap">ground-truth field &mdash; hue is direction</div></div>
+  <div class="panel"><canvas id="c_ugt1" width="300" height="380"></canvas>
+    <div class="cap">ground-truth field</div></div>
+  <div class="panel"><canvas id="c_ugt2" width="300" height="380"></canvas>
+    <div class="cap">ground-truth field</div></div>
+</div>
+<div class="row equal" style="margin-top:8px">
+  <div class="panel"><canvas id="c_grid0" width="300" height="380"></canvas>
+    <div class="cap">grid &mdash; <i>ground truth</i> vs <b>fit</b></div></div>
+  <div class="panel"><canvas id="c_grid1" width="300" height="380"></canvas>
+    <div class="cap">grid</div></div>
+  <div class="panel"><canvas id="c_grid2" width="300" height="380"></canvas>
+    <div class="cap">grid</div></div>
 </div>
 <div class="row" style="margin-top:18px">
   <div class="panel"><canvas id="c_frames" width="620" height="300"></canvas>
@@ -355,12 +394,12 @@ panel("training", KNOBS.train);
 
 function setup(){
   const unit = knob.motion==="translation" ? "px" : "deg";
-  const total = knob.speed*(knob.frames-1);
+  const per = knob.total/Math.max(1, knob.frames-1);
   document.getElementById("setup").innerHTML=
-    `<b>${knob.motion}</b> <span class="dim">at</span> `
-    +`<b>${(+knob.speed).toFixed(3)} ${unit}/frame</b> `
-    +`<span class="dim">over</span> <b>${knob.frames}</b> <span class="dim">frames =</span> `
-    +`<b>${total.toFixed(1)} ${unit}</b> <span class="dim">in total</span>`;
+    `<b>${knob.motion}</b> <span class="dim">of</span> `
+    +`<b>${(+knob.total).toFixed(0)} ${unit}</b> <span class="dim">in total, over</span> `
+    +`<b>${knob.frames}</b> <span class="dim">frames =</span> `
+    +`<b>${per.toFixed(4)} ${unit}/frame</b>`;
 }
 setup();
 
@@ -386,6 +425,20 @@ function blit(g,cv,im){
   g.drawImage(im,(cv.width-im.width*s)/2,(cv.height-im.height*s)/2,im.width*s,im.height*s);
 }
 
+function drawGrid(id, gr){
+  const cv=document.getElementById(id), g=cv.getContext("2d");
+  g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
+  if(!gr||!gr.gt) return;
+  const s=Math.min(cv.width/gr.w, cv.height/gr.h);
+  const ox=(cv.width-gr.w*s)/2, oy=(cv.height-gr.h*s)/2;
+  const paint=(L,col,lw,dash)=>{ g.strokeStyle=col; g.lineWidth=lw;
+    g.setLineDash(dash||[]);
+    L.forEach(p=>{ g.beginPath();
+      p.forEach((q,i)=>{ const X=ox+q[0]*s, Y=oy+q[1]*s; i?g.lineTo(X,Y):g.moveTo(X,Y); });
+      g.stroke(); }); g.setLineDash([]); };
+  paint(gr.gt, "#e5484d", 1.2);
+  paint(gr.fit, "#4da3ff", 1.0, [4,3]);
+}
 function drawFrames(pf, picks){
   const cv=document.getElementById("c_frames"), g=cv.getContext("2d");
   const W=cv.width,H=cv.height,pad={l:56,r:12,t:14,b:34};
@@ -446,6 +499,8 @@ async function poll(){
       drawImg("c_target"+i, r.images["target"+i]);
       drawImg("c_fit"+i, r.images["fit"+i]);
       drawImg("c_epe"+i, r.images["epe"+i]);
+      drawImg("c_ugt"+i, r.images["ugt"+i]);
+      drawGrid("c_grid"+i, (r.grids||{})[String(i)]);
       const cap=document.getElementById("cap"+i);
       if(cap && r.frames && r.frames.length===3)
         cap.textContent=["first","middle","last"][i]+" frame "+r.frames[i]+" — target";
@@ -474,8 +529,8 @@ poll(); startRun();
 
 KNOB_SPEC = {
     "model": [
-        {"name": "speed", "label": "motion per frame (px or deg)", "min": 0.002,
-         "max": 0.5, "default": 0.05, "step": 0.002, "log": True},
+        {"name": "total", "label": "total motion over the sequence (px or deg)",
+         "min": 2, "max": 300, "default": 80, "step": 1, "log": True},
         {"name": "n_levels", "label": "levels", "min": 2, "max": 16, "default": 8,
          "step": 1},
         {"name": "max_resolution", "label": "finest cells per axis, space",

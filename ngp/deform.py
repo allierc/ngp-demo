@@ -214,11 +214,18 @@ class RigidMotion:
     a longer recording does.
     """
 
-    def __init__(self, kind="translation", speed=0.15, n_frames=200,
+    def __init__(self, kind="translation", total=80.0, n_frames=200,
                  shape=(1069, 904), angle_deg=25.0, device="cpu"):
+        # TOTAL over the sequence, not per frame. Per frame reads as more
+        # physical, but it makes the frame-count sweep change two things at
+        # once: at a fixed rate a 100-frame run travels an eighth as far as an
+        # 800-frame one, so the comparison is confounded and the short runs are
+        # invisible. Fixing the total isolates the temporal sampling, which is
+        # what the sweep is for.
         self.kind = kind
-        self.speed = float(speed)              # px/frame, or deg/frame if rotating
+        self.total_motion = float(total)
         self.n = int(n_frames)
+        self.speed = self.total_motion / max(1, self.n - 1)
         h, w = shape
         self.px = torch.tensor([w, h], device=device, dtype=torch.float32)
         a = math.radians(angle_deg)
@@ -227,7 +234,7 @@ class RigidMotion:
 
     def total(self):
         """Motion accumulated over the whole sequence, for the caption."""
-        return self.speed * (self.n - 1)
+        return self.total_motion
 
     def __call__(self, xy, t):
         """xy: (N, 2) in [0,1]^2;  t: scalar in [0,1] -> (N, 2) displacement in px."""

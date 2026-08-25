@@ -44,7 +44,7 @@ from ngp.deform import (apply_mismatch, build_deformation, build_model, build_py
                         field_jacobian, lncc_loss, patch_offsets, pixel_grid,
                         pyramid_level, sample_bilinear, warp_image)
 from ngp.utils import psnr
-from ngp.webui import ABOUT_HTML, CSS, INTERFACE_REG
+from ngp.webui import ABOUT_HTML, CSS, INTERFACE_REG, flow_png
 from scripts.run_registration import (_dense_field, _feather, foreground_mask, load_image,
                                       resolve_inherits, sample_points)
 
@@ -283,7 +283,14 @@ def train_job(cfg, p, device):
                        curve=[], metrics={"n_parameters": n_a + n_b,
                                           "n_levels_total": n_lv_total}, note=note,
                        images={"source": gray_png(sc["source"]),
-                               "target": gray_png(sc["observed"])},
+                               "target": gray_png(sc["observed"]),
+                               # THE GROUND TRUTH ITSELF. Everything else on the
+                               # page is a consequence of the deformation; on a
+                               # 12 px shear band shown in a 300 px panel the
+                               # consequence is a few screen pixels wide and easy
+                               # to miss entirely.
+                               "ugt": flow_png(sc["ugt_dense"].cpu().numpy(),
+                                               EPE_LUT_MAX * 2)},
                        grid={}, stamp=JOB["stamp"] + 1)
         print(f"[images] source and target sent ({w}x{h})", flush=True)
         first_render = True
@@ -424,6 +431,9 @@ telling them apart.</p>
 </div>
 <div id="levlegend" class="note"></div>
 <div class="row" style="margin-top:18px">
+  <div class="panel"><canvas id="c_ugt" width="330" height="460"></canvas>
+    <div class="cap">the ground-truth field &mdash; hue is direction, brightness
+      is magnitude</div></div>
   <div class="panel"><canvas id="c_grid" width="330" height="460"></canvas>
     <div class="cap">grid &mdash; <i>ground truth</i> vs <b>fit</b></div></div>
   <div class="panel"><canvas id="c_epe" width="330" height="460"></canvas>
@@ -744,6 +754,7 @@ async function poll(){
     LAST=r.stamp;
     drawImg("c_source", r.images.source); drawImg("c_target", r.images.target);
     drawImg("c_warp", r.images.warped);   drawImg("c_epe", r.images.epe);
+    drawImg("c_ugt", r.images.ugt);
     drawGrid(r.grid); drawLevels(r.levels);
     drawCurve(r.curve, r.switches); stats(r);
   }
