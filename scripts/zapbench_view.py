@@ -141,7 +141,7 @@ move the slider to travel through the run.</p>
 <div class="stats" id="stats"></div>
 </div><script>
 let PTS=null, VAL=null, N=0, T=1, ROT={x:-0.35,y:0.6}, ZOOM=1.25, DRAG=null;
-let MODE="mag", FRAME=0, VMAX=1, BUSY=false, SCALE=32, PLAY=false;
+let MODE="mag", FRAME=0, VMAX=1, BUSY=false, SCALE=16, PLAY=false, SUB0=0;
 // Advances by a stride so the whole run plays in a few hundred steps, and awaits
 // each frame rather than firing on a timer, so it self-throttles to the network.
 async function run(){
@@ -173,10 +173,12 @@ function seg(name, opts, cur, cb){
     s.appendChild(b); });
   gp.append(l,s); C.appendChild(gp);
 }
-seg("colour by", [["|u|","mag"],["c0","0"],["c1","1"],["c2","2"]], "mag",
+seg("colour by", [["|u|","mag"],["direction","dir"],["c0","0"],["c1","1"],["c2","2"]], "mag",
     v=>{ MODE=v; loadFrame(FRAME); });
-seg("scale (voxels)", [["8",8],["16",16],["32",32],["64",64]], 32,
+seg("scale (voxels)", [["4",4],["8",8],["16",16],["32",32]], 16,
     v=>{ SCALE=v; loadFrame(FRAME); });
+seg("baseline", [["none",0],["subtract frame 0",1]], 0,
+    v=>{ SUB0=v; loadFrame(FRAME); });
 seg("", [["play",1],["pause",0]], 0, v=>{ PLAY=!!v; if(PLAY) run(); });
 
 const K=document.getElementById("knobs");
@@ -214,6 +216,12 @@ function ramp(t){   // the repo's level ramp: bright at both ends
   const a=S[i], b=S[Math.min(S.length-1,i+1)];
   return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f];
 }
+function hue(t){   // cyclic, for an angle: no seam except where the angle wraps
+  const h=(t%1)*6, i=Math.floor(h), f=h-i;
+  const q=[[255,60,60],[255,215,60],[60,255,90],[60,230,255],[110,110,255],[255,80,220]];
+  const a=q[i%6], b=q[(i+1)%6];
+  return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f];
+}
 function diverge(v){  // signed: blue negative, white zero, red positive
   const t=Math.max(-1,Math.min(1,v));
   return t<0 ? [77+178*(1+t), 163+92*(1+t), 255] : [255, 255-148*t, 255-148*t];
@@ -238,7 +246,7 @@ function draw(){
     if(z2 <= depth[o]) continue;          // painter's algorithm on a z-buffer
     depth[o]=z2;
     const v=VAL[i]/255;
-    const c = MODE==="mag" ? ramp(v) : diverge(v*2-1);
+    const c = MODE==="mag" ? ramp(v) : MODE==="dir" ? hue(v) : diverge(v*2-1);
     const k=o*4;
     d[k]=c[0]; d[k+1]=c[1]; d[k+2]=c[2];
   }
@@ -248,20 +256,26 @@ function draw(){
 async function loadFrame(t){
   if(BUSY) return; BUSY=true;
   FRAME=t;
-  const r=await (await fetch(`/api/frame?t=${t}&mode=${MODE}&vmax=${SCALE}`)).json();
+  const r=await (await fetch(`/api/frame?t=${t}&mode=${MODE}&vmax=${SCALE}&sub0=${SUB0}`)).json();
   VAL=new Uint8Array(atob(r.val).split("").map(c=>c.charCodeAt(0)));
   VMAX=r.vmax;
   let bar="";
   for(let i=0;i<=20;i++){
-    const c = MODE==="mag" ? ramp(i/20) : diverge(i/10-1);
+    const c = MODE==="mag" ? ramp(i/20) : MODE==="dir" ? hue(i/20) : diverge(i/10-1);
     bar+=`<span style="display:inline-block;width:13px;height:9px;`
         +`background:rgb(${c[0]|0},${c[1]|0},${c[2]|0})"></span>`;
   }
-  const ends = MODE==="mag" ? `0 &rarr; ${SCALE} voxels`
+  const ends = MODE==="dir" ? `0 &rarr; 360&deg; in the c1&ndash;c2 plane`
+             : MODE==="mag" ? `0 &rarr; ${SCALE} voxels`
                             : `&minus;${SCALE} &rarr; +${SCALE} voxels`;
   document.getElementById("stats").innerHTML=
-    `frame <b>${t}</b> of ${T-1} &nbsp;&middot;&nbsp; `
-    +`mean <b>${r.mean.toFixed(2)}</b> vox, largest <b>${r.data_max.toFixed(1)}</b>`
+    `frame <b>${t}</b> of ${T-1}`
+    +(SUB0 ? ` &nbsp;&middot;&nbsp; <b>minus frame 0</b>` : "")
+    +` &nbsp;&middot;&nbsp; `
+    +(MODE==="dir"
+        ? `mean direction <b>${r.mean.toFixed(0)}&deg;</b>, in-plane |u| up to `
+          +`<b>${r.data_max.toFixed(1)}</b>`
+        : `mean <b>${r.mean.toFixed(2)}</b> vox, largest <b>${r.data_max.toFixed(1)}</b>`)
     +(r.clipped>0 ? ` &nbsp;&middot;&nbsp; <span class="bad">`
                     +`${(r.clipped*100).toFixed(1)}% beyond the scale</span>` : "")
     +`<br><span style="line-height:0">${bar}</span> `
@@ -320,10 +334,32 @@ class Handler(BaseHTTPRequestHandler):
             t = int(float(q.get("t", 0)))
             mode = q.get("mode", "mag")
             a, mag = frame(t)
+            # SUBTRACT FRAME 0. The field is dominated by a near-constant offset
+            # -- one component sits at about -9 for the entire run -- so the
+            # drift, which is the part that varies and the part a registration
+            # has to track, is a small signal riding on a large constant. Taking
+            # frame 0 as the baseline shows u(t) - u(0) and nothing else.
+            if q.get("sub0") == "1" and int(t) != 0:
+                a = a - frame(0)[0]
+                mag = np.linalg.norm(a, axis=0)
+            elif q.get("sub0") == "1":
+                a = np.zeros_like(a)
+                mag = np.zeros_like(mag)
             # A FIXED scale by default. Rescaling to each frame's own percentile
             # makes a drifting field look static: the colours stay put while the
             # displacement grows underneath them.
             fixed = q.get("vmax")
+            if mode == "dir":
+                # In-plane direction, in the plane orthogonal to component 0.
+                # An angle wraps, so it gets a cyclic ramp and a fixed 0-360
+                # scale; a linear one would put a seam through the middle of it.
+                ang = np.arctan2(a[1], a[2]) % (2 * np.pi)
+                val = ang / (2 * np.pi)
+                vmax, d = 360.0, np.hypot(a[1], a[2])
+                return self._send(json.dumps(
+                    {"val": b64((val * 255).astype(np.uint8)), "vmax": vmax,
+                     "mean": float(np.degrees(np.arctan2(a[1].mean(), a[2].mean())) % 360),
+                     "data_max": float(d.max()), "clipped": 0.0}), "application/json")
             if mode == "mag":
                 d = mag
                 vmax = float(fixed) if fixed else float(np.percentile(mag, 99)) or 1.0
