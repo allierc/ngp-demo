@@ -59,7 +59,7 @@ DISPLAY_H = 460                      # panel height in px; images are sent downs
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "grid": {}, "note": "", "stamp": 0,
-       "pyramid_sigma": 0, "levels": None}
+       "pyramid_sigma": 0, "levels": None, "switches": []}
 LOCK = threading.Lock()
 STOP = threading.Event()
 SCENE = {}                           # cached image / masks / ground truth per key
@@ -294,6 +294,9 @@ def train_job(cfg, p, device):
         src_p = build_pyramid(sc["source"], pyr["sigma_px"])
         tgt_p = build_pyramid(sc["observed"], pyr["sigma_px"])
         lvl = -1
+        with LOCK:
+            JOB["switches"] = [{"step": int(a * int(p["steps"])), "sigma": float(sg)}
+                               for a, sg in zip(pyr["switch_at"], pyr["sigma_px"])]
         every = max(1, steps // 40)
         t0 = t0_all = time.perf_counter()
 
@@ -408,7 +411,8 @@ telling them apart.</p>
   <div class="panel"><canvas id="c_epe" width="330" height="460"></canvas>
     <div class="cap">endpoint error &mdash; fixed scale 0&ndash;__EPEMAX__ px</div></div>
   <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
-    <div class="cap">loss and endpoint error against iteration</div></div>
+    <div class="cap">loss (against the current pyramid level) and endpoint
+      error (against the analytic field)</div></div>
 </div>
 <div class="stats" id="stats"></div>
 <div class="modal" id="about" onclick="if(event.target===this)closeAbout()">
@@ -638,7 +642,7 @@ function drawGrid(gr){
   paint(gr.fit, "#4da3ff", 1.0, [4,3]);
 }
 
-function drawCurve(curve){
+function drawCurve(curve, switches){
   const cv=document.getElementById("c_curve"), g=cv.getContext("2d");
   const W=cv.width, H=cv.height;
   g.fillStyle="#000"; g.fillRect(0,0,W,H);
@@ -661,6 +665,19 @@ function drawCurve(curve){
   const line=(key,col)=>{ g.strokeStyle=col; g.lineWidth=1.8; g.beginPath();
     curve.forEach((c,i)=>{ const X_=X(c.step), Y_=Y(c[key]);
       i?g.lineTo(X_,Y_):g.moveTo(X_,Y_); }); g.stroke(); };
+  // The loss is measured against the CURRENT pyramid level, so it is not
+  // comparable across a switch: sharpening the target raises the residual even
+  // as the geometry improves. Mark the switches rather than leave the jump
+  // looking like a divergence.
+  (switches || []).forEach(sw=>{
+    if(sw.step<=x0 || sw.step>x1) return;
+    const X_=X(sw.step);
+    g.strokeStyle="#4a4a4a"; g.lineWidth=1; g.setLineDash([3,3]);
+    g.beginPath(); g.moveTo(X_,pad.t); g.lineTo(X_,H-pad.b); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle="#7a7a7a"; g.font="9px sans-serif"; g.textAlign="center";
+    g.fillText(`\u03c3 ${sw.sigma}`, X_, pad.t-3); g.textAlign="left";
+  });
   line("loss","#e8e8e8"); line("epe_fg","#4da3ff"); line("epe_bg","#e5a23c");
   g.fillStyle="#8a8a8a"; g.font="11px sans-serif";
   g.fillText("iteration", W/2-22, H-10);
@@ -695,7 +712,8 @@ async function poll(){
     LAST=r.stamp;
     drawImg("c_source", r.images.source); drawImg("c_target", r.images.target);
     drawImg("c_warp", r.images.warped);   drawImg("c_epe", r.images.epe);
-    drawGrid(r.grid); drawLevels(r.levels); drawCurve(r.curve); stats(r);
+    drawGrid(r.grid); drawLevels(r.levels);
+    drawCurve(r.curve, r.switches); stats(r);
   }
   // Only stop once the run has actually been observed running: a not-yet-started
   // job and a finished one look identical from here.
