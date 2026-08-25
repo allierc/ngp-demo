@@ -466,8 +466,12 @@ function closeHelp(){document.getElementById("help").classList.remove("open");}
 document.addEventListener("keydown",e=>{
   if(e.key==="Escape"){ closeAbout(); closeHelp(); }});
 const SPEC=__SPEC__, KNOBS=__KNOBS__, DEF=__DEF__, LUTMAX=__LUTMAX__;
-const sel={deformation:SPEC.deformation[0], mismatch:SPEC.mismatch[0],
-           model:SPEC.model[0]};
+// slip_band by default: it is the one deformation the smooth parameterisations
+// structurally cannot represent, so it separates them on opening rather than
+// after you have gone looking.
+const sel={deformation: SPEC.deformation.includes("slip_band") ? "slip_band"
+                                                              : SPEC.deformation[0],
+           mismatch:SPEC.mismatch[0], model:SPEC.model[0]};
 const knob=Object.assign({}, DEF);
 let LAST=-1, POLL=null, IMG={}, SEEN_RUNNING=false;
 

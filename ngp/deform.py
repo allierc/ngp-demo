@@ -204,6 +204,50 @@ class GaussianBumps:
         return self.scale * self._raw(xy)
 
 
+class RigidMotion:
+    """A slowly evolving rigid deformation: u(x, t), translation or rotation.
+
+    The point of a time-varying ground truth is that the field is exactly known
+    at every instant, so a fit over (x, y, t) can be scored frame by frame --
+    including at times between the ones it was trained on. Motion is stated per
+    frame, so a longer sequence at the same speed travels further, which is what
+    a longer recording does.
+    """
+
+    def __init__(self, kind="translation", speed=0.15, n_frames=200,
+                 shape=(1069, 904), angle_deg=25.0, device="cpu"):
+        self.kind = kind
+        self.speed = float(speed)              # px/frame, or deg/frame if rotating
+        self.n = int(n_frames)
+        h, w = shape
+        self.px = torch.tensor([w, h], device=device, dtype=torch.float32)
+        a = math.radians(angle_deg)
+        self.dir = torch.tensor([math.cos(a), math.sin(a)], device=device)
+        self.centre = torch.tensor([0.5, 0.5], device=device)
+
+    def total(self):
+        """Motion accumulated over the whole sequence, for the caption."""
+        return self.speed * (self.n - 1)
+
+    def __call__(self, xy, t):
+        """xy: (N, 2) in [0,1]^2;  t: scalar in [0,1] -> (N, 2) displacement in px."""
+        f = float(t) * (self.n - 1)                       # frame index
+        if self.kind == "translation":
+            return (self.dir * (self.speed * f)).expand(xy.shape[0], 2)
+        th = math.radians(self.speed * f)
+        # rotation about the centre, in PIXEL space -- doing it in normalised
+        # coordinates would shear the result on a non-square image
+        d = (xy - self.centre) * self.px
+        c, s = math.cos(th), math.sin(th)
+        rot = torch.stack([d[:, 0] * c - d[:, 1] * s,
+                           d[:, 0] * s + d[:, 1] * c], dim=1)
+        return rot - d
+
+    def at(self, t):
+        """A plain callable for one instant, for warp_image()."""
+        return lambda xy: self(xy, t)
+
+
 class MultiScaleBands:
     """Displacement whose spatial SCALE varies across the frame, at constant amplitude.
 
