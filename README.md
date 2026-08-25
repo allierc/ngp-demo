@@ -57,6 +57,29 @@ python tests/check_pages.py                                   # both GUI pages, 
 
 Outputs (images, mp4s, figures, `report.json`) land in `out/`.
 
+## An application: the zapbench flow field
+
+```bash
+pip install tensorstore                  # only this script needs it
+python scripts/zapbench_view.py          # http://localhost:8023
+```
+
+Reads `gs://zapbench-release` anonymously and shows the flow field of a
+light-sheet zebrafish run in 3D: 3 x 36 x 83 x 128 x 7879 displacements, drawn
+only where the segmentation says a cell is. Drag to rotate, slider to travel
+through the run.
+
+Two measurements from that volume, both made here:
+
+* **21.6%** of the flow voxels contain a segmented cell. The other 78% is
+  background where the flow is extrapolated, which is the case for sampling a
+  representation rather than storing a dense grid.
+* Inside the mask and across the whole 7,879-frame run, the time-varying field
+  is **two spatial modes to 0.56 voxels RMS** (97.9% of the energy), three to
+  0.43, and flat after that -- 40 modes only reach 0.158. Mean displacement in
+  the mask is 11.7 voxels. So a dense 4D grid stores ~250,000 numbers per frame
+  to carry a few numbers' worth of new information per frame.
+
 ## Install
 
 ```bash

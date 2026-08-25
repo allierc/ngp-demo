@@ -1,0 +1,316 @@
+#!/usr/bin/env python
+"""Browser viewer for the zapbench flow field: the mask in 3D, and the flow on it.
+
+    python scripts/zapbench_view.py            # http://localhost:8023
+    python scripts/zapbench_view.py --stride 2 # every 2nd masked voxel, lighter
+
+Reads `gs://zapbench-release` anonymously, so it needs `tensorstore` and a
+network, and neither is required by the rest of this repo:
+
+    pip install tensorstore
+
+The flow field is 3 x 36 x 83 x 128 x 7879 and the segmentation is
+2048 x 1328 x 72 -- exactly 16 x 16 x 2 the flow grid -- so a block-max over the
+segmentation gives a per-flow-voxel mask of "a segmented cell is here". That is
+21.6% of the volume; the other 78% is background where the flow is extrapolated
+and means nothing, which is the whole reason a sparse representation is being
+considered at all.
+
+Rendering is deliberately dependency-free: the point cloud is projected in
+JavaScript and written straight into an ImageData buffer, so there is no CDN, no
+WebGL and nothing to install in the browser. Drag to rotate, scroll to zoom,
+drag the time slider to move through the run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ngp.webui import CSS
+
+BUCKET = "zapbench-release"
+FLOW = "volumes/20240930/flow_fields/"
+SEG = "volumes/20240930/segmentation/"
+
+STATE: dict = {"ready": False, "note": "opening the volumes..."}
+LOCK = threading.Lock()
+CACHE: dict = {}
+
+
+def _open(path):
+    import tensorstore as ts
+    return ts.open({"driver": "zarr3", "kvstore": {"driver": "gcs",
+                    "bucket": BUCKET, "path": path}}, open=True, read=True).result()
+
+
+def build(stride: int):
+    """Mask + geometry, once. The mask read is the slow part, about 30 s."""
+    t0 = time.perf_counter()
+    flow = _open(FLOW)
+    C, Z, Y, X, T = flow.domain.shape
+    seg = _open(SEG)
+    SX, SY, SZ = seg.domain.shape
+    fx, fy, fz = SX // X, SY // Y, SZ // Z
+    with LOCK:
+        STATE["note"] = f"building the mask from {SX}x{SY}x{SZ} segmentation..."
+    mask = np.zeros((Z, Y, X), dtype=bool)
+    for z in range(Z):
+        s = seg[:, :, z * fz:(z + 1) * fz].read().result()
+        mask[z] = (s > 0).reshape(X, fx, Y, fy, fz).any(axis=(1, 3, 4)).T
+    idx = np.flatnonzero(mask.reshape(-1))
+    if stride > 1:
+        idx = idx[::stride]
+    zz, yy, xx = np.unravel_index(idx, (Z, Y, X))
+    # centred and scaled to [-1, 1] on the longest axis, so the client can rotate
+    # it without knowing the voxel geometry
+    pts = np.stack([xx, yy, zz], 1).astype(np.float32)
+    ctr = np.array([X, Y, Z], dtype=np.float32) / 2
+    pts = (pts - ctr) / max(X, Y, Z) * 2
+    with LOCK:
+        CACHE.update(flow=flow, idx=idx, shape=(Z, Y, X), T=T, pts=pts)
+        STATE.update(ready=True, n_points=int(len(idx)), n_masked=int(mask.sum()),
+                     n_total=int(mask.size), T=int(T), stride=stride,
+                     note=f"{int(mask.sum()):,} of {mask.size:,} flow voxels "
+                          f"({mask.mean()*100:.1f}%) contain a segmented cell; "
+                          f"showing {len(idx):,} of them "
+                          f"({time.perf_counter()-t0:.0f} s to load)")
+    print("[ready] " + STATE["note"], flush=True)
+
+
+def frame(t: int):
+    """Per-point displacement at time t: magnitude, and the three components."""
+    flow, idx = CACHE["flow"], CACHE["idx"]
+    a = flow[:, :, :, :, int(t)].read().result().reshape(3, -1)[:, idx]   # (3, N)
+    mag = np.linalg.norm(a, axis=0)
+    return a, mag
+
+
+def b64(a: np.ndarray) -> str:
+    return base64.b64encode(np.ascontiguousarray(a)).decode()
+
+
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>zapbench flow field</title>
+<style>__CSS__
+  canvas#view { cursor:grab; }
+  canvas#view:active { cursor:grabbing; }
+</style></head><body><div class="wrap">
+<h1>zapbench &mdash; the flow field on the cells</h1>
+<p class="sub">Every point is one flow-field voxel that a segmented cell occupies.
+The other 78% of the volume is background, where the flow is extrapolated and means
+nothing &mdash; it is not drawn, which is the point. Drag to rotate, scroll to zoom,
+move the slider to travel through the run.</p>
+<div class="controls" id="controls"></div>
+<div class="knobs" id="knobs"></div>
+<div class="note" id="note">loading...</div>
+<div class="row" style="margin-top:14px">
+  <div class="panel"><canvas id="view" width="900" height="620"></canvas>
+    <div class="cap" id="cap">masked voxels</div></div>
+</div>
+<div class="stats" id="stats"></div>
+</div><script>
+let PTS=null, VAL=null, N=0, T=1, ROT={x:-0.35,y:0.6}, ZOOM=1.25, DRAG=null;
+let MODE="mag", FRAME=0, VMAX=1, BUSY=false;
+
+const cv=document.getElementById("view"), g=cv.getContext("2d");
+const img=g.createImageData(cv.width, cv.height);
+
+function seg(name, opts, cur, cb){
+  const C=document.getElementById("controls");
+  const gp=document.createElement("div"); gp.className="group";
+  const l=document.createElement("div"); l.className="label"; l.textContent=name;
+  const s=document.createElement("div"); s.className="seg";
+  opts.forEach(([txt,val])=>{
+    const b=document.createElement("button"); b.textContent=txt;
+    b.setAttribute("aria-pressed", cur===val);
+    b.onclick=()=>{ [...s.children].forEach(c=>c.setAttribute("aria-pressed",c===b));
+                    cb(val); };
+    s.appendChild(b); });
+  gp.append(l,s); C.appendChild(gp);
+}
+seg("colour by", [["|u|","mag"],["x","0"],["y","1"],["z","2"]], "mag",
+    v=>{ MODE=v; loadFrame(FRAME); });
+
+const K=document.getElementById("knobs");
+K.innerHTML='<div class="title">time</div>';
+const kn=document.createElement("div"); kn.className="knob";
+kn.style.minWidth="100%";
+const lab=document.createElement("div"); lab.className="kl";
+const val=document.createElement("b"); val.textContent="0";
+lab.innerHTML="<span>frame</span>"; lab.appendChild(val);
+const rng=document.createElement("input"); rng.type="range"; rng.min=0; rng.value=0;
+const ends=document.createElement("div"); ends.className="ends";
+kn.append(lab,rng,ends); K.appendChild(kn);
+let pend=null;
+rng.oninput=()=>{ val.textContent=rng.value;
+  clearTimeout(pend); pend=setTimeout(()=>loadFrame(+rng.value), 90); };
+
+// Rotation is recomputed from the drag origin on every move, not accumulated,
+// so a dropped mouseup cannot leave the view spinning.
+cv.addEventListener("mousedown", e=>{ DRAG={sx:e.clientX, sy:e.clientY,
+                                            rx:ROT.x, ry:ROT.y}; });
+window.addEventListener("mouseup", ()=>{ DRAG=null; });
+window.addEventListener("mousemove", e=>{
+  if(!DRAG) return;
+  ROT.y = DRAG.ry + (e.clientX-DRAG.sx)*0.006;
+  ROT.x = DRAG.rx + (e.clientY-DRAG.sy)*0.006;
+  draw();
+});
+cv.addEventListener("wheel", e=>{ e.preventDefault();
+  ZOOM = Math.min(6, Math.max(0.4, ZOOM*(e.deltaY<0?1.12:0.9))); draw(); },
+  {passive:false});
+
+function ramp(t){   // the repo's level ramp: bright at both ends
+  const S=[[77,163,255],[64,224,208],[124,255,90],[255,210,77],[255,107,107]];
+  const x=Math.max(0,Math.min(1,t))*(S.length-1), i=Math.floor(x), f=x-i;
+  const a=S[i], b=S[Math.min(S.length-1,i+1)];
+  return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f];
+}
+function diverge(v){  // signed: blue negative, white zero, red positive
+  const t=Math.max(-1,Math.min(1,v));
+  return t<0 ? [77+178*(1+t), 163+92*(1+t), 255] : [255, 255-148*t, 255-148*t];
+}
+
+function draw(){
+  if(!PTS) return;
+  const W=cv.width, H=cv.height, d=img.data;
+  d.fill(0);
+  for(let i=3;i<d.length;i+=4) d[i]=255;
+  const cy=Math.cos(ROT.y), sy=Math.sin(ROT.y);
+  const cx=Math.cos(ROT.x), sx=Math.sin(ROT.x);
+  const sc=Math.min(W,H)*0.42*ZOOM;
+  const depth=new Float32Array(W*H).fill(-1e9);
+  for(let i=0;i<N;i++){
+    const X=PTS[3*i], Y=PTS[3*i+1], Z=PTS[3*i+2];
+    const x1=X*cy - Z*sy,  z1=X*sy + Z*cy;
+    const y1=Y*cx - z1*sx, z2=Y*sx + z1*cx;
+    const px=(W/2 + x1*sc)|0, py=(H/2 + y1*sc)|0;
+    if(px<0||px>=W||py<0||py>=H) continue;
+    const o=py*W+px;
+    if(z2 <= depth[o]) continue;          // painter's algorithm on a z-buffer
+    depth[o]=z2;
+    const v=VAL[i]/255;
+    const c = MODE==="mag" ? ramp(v) : diverge(v*2-1);
+    const k=o*4;
+    d[k]=c[0]; d[k+1]=c[1]; d[k+2]=c[2];
+  }
+  g.putImageData(img,0,0);
+}
+
+async function loadFrame(t){
+  if(BUSY) return; BUSY=true;
+  FRAME=t;
+  const r=await (await fetch(`/api/frame?t=${t}&mode=${MODE}`)).json();
+  VAL=new Uint8Array(atob(r.val).split("").map(c=>c.charCodeAt(0)));
+  VMAX=r.vmax;
+  document.getElementById("stats").innerHTML=
+    `frame <b>${t}</b> of ${T-1} &nbsp;&middot;&nbsp; `
+    +(MODE==="mag" ? `|u| up to <b>${r.vmax.toFixed(1)}</b> voxels, mean `
+                     +`<b>${r.mean.toFixed(2)}</b>`
+                   : `component ${MODE} in <b>&plusmn;${r.vmax.toFixed(1)}</b> voxels, `
+                     +`mean <b>${r.mean.toFixed(2)}</b>`);
+  BUSY=false; draw();
+}
+
+async function boot(){
+  for(;;){
+    const s=await (await fetch("/api/state")).json();
+    document.getElementById("note").textContent=s.note;
+    if(s.ready){ T=s.T; rng.max=T-1;
+      ends.innerHTML=`<span>0</span><span>${T-1}</span>`;
+      const geo=await (await fetch("/api/geometry")).json();
+      const raw=atob(geo.pts); const buf=new Uint8Array(raw.length);
+      for(let i=0;i<raw.length;i++) buf[i]=raw.charCodeAt(i);
+      PTS=new Float32Array(buf.buffer); N=geo.n;
+      document.getElementById("cap").textContent =
+        `${geo.n.toLocaleString()} masked voxels of ${s.n_total.toLocaleString()}`;
+      loadFrame(0); return; }
+    await new Promise(r=>setTimeout(r, 1000));
+  }
+}
+boot();
+</script></body></html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, body, ctype):
+        body = body.encode() if isinstance(body, str) else body
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if u.path in ("/", "/index.html"):
+            return self._send(PAGE.replace("__CSS__", CSS), "text/html; charset=utf-8")
+        if u.path == "/api/state":
+            with LOCK:
+                return self._send(json.dumps(STATE), "application/json")
+        if u.path == "/api/geometry":
+            with LOCK:
+                pts = CACHE["pts"]
+            return self._send(json.dumps({"pts": b64(pts), "n": int(len(pts))}),
+                              "application/json")
+        if u.path == "/api/frame":
+            t = int(float(q.get("t", 0)))
+            mode = q.get("mode", "mag")
+            a, mag = frame(t)
+            if mode == "mag":
+                vmax = float(np.percentile(mag, 99)) or 1.0
+                val = np.clip(mag / vmax, 0, 1)
+                mean = float(mag.mean())
+            else:
+                c = a[int(mode)]
+                vmax = float(np.percentile(np.abs(c), 99)) or 1.0
+                val = np.clip(c / vmax, -1, 1) * 0.5 + 0.5
+                mean = float(c.mean())
+            return self._send(json.dumps({"val": b64((val * 255).astype(np.uint8)),
+                                          "vmax": vmax, "mean": mean}),
+                              "application/json")
+        self.send_error(404)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--port", type=int, default=8023)
+    p.add_argument("--stride", type=int, default=1,
+                   help="show every Nth masked voxel; 1 shows all ~83,000")
+    a = p.parse_args()
+    try:
+        import tensorstore                                   # noqa: F401
+    except ImportError:
+        sys.exit("this viewer needs tensorstore:  pip install tensorstore")
+    threading.Thread(target=build, args=(a.stride,), daemon=True).start()
+    print(f"http://localhost:{a.port}   (loading the mask takes ~30 s)")
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
+    except OSError as e:
+        if e.errno == 98:
+            sys.exit(f"port {a.port} is already in use -- pass --port with a free one")
+        raise
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
