@@ -303,9 +303,9 @@ KNOBS = [
     {"name": "n_features", "label": "features per level F", "min": 1, "max": 8,
      "default": 2, "step": 1},
     {"name": "log2_hashmap_size", "label": "log2 table size T", "min": 10,
-     "max": 24, "default": 17, "step": 1},
+     "max": 24, "default": 16, "step": 1},
     {"name": "base_resolution", "label": "coarsest cells per axis", "min": 2,
-     "max": 256, "default": 16, "step": 1},
+     "max": 256, "default": 129, "step": 1},
     {"name": "per_level_scale", "label": "growth per level b", "min": 1.1,
      "max": 2.0, "default": 1.35, "step": 0.05},
     {"name": "max_resolution", "label": "finest cells per axis (0 = the pixel count)",
@@ -358,7 +358,7 @@ on quality against time and against parameter count.</p>
   <div class="panel"><canvas id="c_err" width="330" height="460"></canvas>
     <div class="cap">absolute error &mdash; fixed scale 0&ndash;__ERRMAX__</div></div>
   <div class="panel"><canvas id="c_levels" width="330" height="460"></canvas>
-    <div class="cap">finest level contributing in each block &mdash; signal, not scale</div></div>
+    <div class="cap">finest level contributing, per 64 px analysis block</div></div>
 </div>
 <div id="zoomnote" class="note"></div>
 <div id="levlegend" class="note"></div>
@@ -658,8 +658,11 @@ function drawLevels(bk){
     `<div style="margin-bottom:2px">level colour scale, fixed 0&ndash;${LUTMAX}`
     +` &nbsp; (applies to the grid and to the effective-level map)</div>`
     +`<div style="line-height:0">${bar}</div><div>${ticks}</div>`
-    +`<div style="margin-top:5px">levels contributing (blank regions have no `
-    +`scale; levels do not specialise by frequency): `
+    +`<div style="margin-top:5px">the squares are 64 px analysis blocks, not `
+    +`encoder cells: ${tinted} of ${bk.blocks.length} are tinted because their `
+    +`level's cells are under 3 screen px. Lower "finest cells per axis" to see `
+    +`real cells. Levels contributing (blank regions have no scale; levels do `
+    +`not specialise by frequency): `
     + used.map(l=>{
         const b=bk.blocks.find(q=>q.level===l);
         return `<span style="color:${levColor(l/LUTMAX)}">&#9632; ${l} `
