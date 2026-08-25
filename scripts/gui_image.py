@@ -302,8 +302,11 @@ KNOBS = [
      "step": 1},
     {"name": "n_features", "label": "features per level F", "min": 1, "max": 8,
      "default": 2, "step": 1},
-    {"name": "log2_hashmap_size", "label": "log2 table size T", "min": 10,
-     "max": 24, "default": 10, "step": 1},
+    # Shown as the entry count rather than the exponent: "2^10" is not a
+    # quantity anyone compares against a level's node count by eye, and that
+    # comparison is the whole meaning of the knob.
+    {"name": "log2_hashmap_size", "label": "max entries per level", "min": 10,
+     "max": 24, "default": 10, "step": 1, "pow2": True},
     {"name": "base_resolution", "label": "coarsest cells per axis", "min": 2,
      "max": 256, "default": 4, "step": 1},
     {"name": "per_level_scale", "label": "growth per level b", "min": 1.1,
@@ -465,8 +468,9 @@ function panel(el, title, list){
     const d=document.createElement("div"); d.className="knob";
     const lab=document.createElement("div"); lab.className="kl";
     const val=document.createElement("b");
-    const fmt=v=>p.log ? (+v).toExponential(1)
-                       : (p.step<1 ? (+v).toFixed(2) : String(Math.round(v)));
+    const fmt=v=>p.pow2 ? `2^${Math.round(v)} = ${Math.pow(2,Math.round(v)).toLocaleString()}`
+                        : p.log ? (+v).toExponential(1)
+                        : (p.step<1 ? (+v).toFixed(2) : String(Math.round(v)));
     const rawOf=v=>p.log ? Math.log10(v) : v;
     const valOf=r=>p.log ? Math.pow(10, r) : +r;
     val.textContent=fmt(knob[p.name]);
@@ -510,6 +514,18 @@ function drawLadder(ladder, info){
   if(info && info.n_enc!==undefined)
     h+=`<div class="note">${info.n_enc.toLocaleString()} table + `
       +`${info.n_mlp.toLocaleString()} decoder parameters</div>`;
+  // The comparison the knob is actually about: nodes wanted against entries
+  // allowed. A level is dense while it fits and hashes once it does not.
+  if(!ladder.length){ document.getElementById("ladder").innerHTML=h; return; }
+  const T=Math.pow(2, Math.round(knob.log2_hashmap_size));
+  const fine=ladder[ladder.length-1];
+  const want=(fine.rx+1)*(fine.ry+1);
+  const nh=ladder.filter(L=>!L.dense).length;
+  h+=`<div class="note">the finest level wants ${want.toLocaleString()} nodes and `
+    +`may hold ${T.toLocaleString()}: `
+    + (nh ? `<span style="color:var(--amber)">${nh} of ${ladder.length} levels `
+           +`collide</span>` : `every level fits, so this knob does nothing here`)
+    +`</div>`;
   document.getElementById("ladder").innerHTML=h;
 }
 
