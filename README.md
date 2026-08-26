@@ -60,6 +60,7 @@ python scripts/demo_gradients.py                              # derivatives of a
 python tests/test_ngp.py                                      # 9 passed
 python tests/level_specialisation.py                          # the negative result
 python tests/check_pages.py                                   # all 3 GUI pages, needs node
+python scripts/collision_audit.py                             # who wins a collision
 ```
 
 Outputs (images, mp4s, figures, `report.json`) land in `out/`.
@@ -193,6 +194,38 @@ Matched-intensity arm, endpoint error in pixels (foreground / band / background)
   prior, and in an unconstrained region the prior is the entire answer.
 * **`tensor_256` is the worst of both**: competitive in the foreground, 4.9-13.0 px
   in the band. Capacity without locality extrapolates badly exactly at the mask edge.
+
+## Who wins a hash collision?
+
+`note/collision_audit.pdf` is a short note on the one claim in the paper that is
+easy to accept and hard to check: that a table row shared by two distant points
+is not corrupted, because "the gradients of the more important samples dominate
+the collision average".
+
+```bash
+python scripts/collision_audit.py            # 6 fits, writes the figure and the json
+python scripts/collision_audit.py --replot   # rebuild the figure from the json
+python note/build_note.py                    # fill the note from the json, needs pdflatex
+```
+
+The painting is cut into a checkerboard of 32 px blocks so that the two regions
+are the same picture at the same scales -- 120,728 against 120,640 pixels, mean
+|grad I| 0.0367 against 0.0356, and equal interpolation weight on the rows they
+share to within 0.4%. Region B is then fitted at loss weight lambda, which is
+the paper's "importance" made a dial, at a table that collides (11 of 18 levels
+hashed) and at one where every level is dense.
+
+| loss weight on B | A / B, colliding | A / B, dense | B's loss to collisions |
+|---|---|---|---|
+| 1 | 31.84 / 32.14 dB | 32.72 / 33.06 dB | 0.92 dB |
+| 0.1 | 32.00 / 31.19 dB | 32.73 / 33.05 dB | 1.85 dB |
+| 0.01 | 32.08 / **28.74** dB | 32.72 / 33.00 dB | **4.26 dB** |
+
+**Down-weighting B costs it 0.06 dB when it owns its rows and 4.26 dB when it
+shares them.** The gradient mass arriving at a shared hashed row is split 0.507
+in A's favour at lambda = 1 and 0.970 at lambda = 0.01, and zeroing rows by that
+split shows who each row was serving. The claim holds; what the paper does not
+say is that the loser keeps reading the row it no longer sets.
 
 ## Stage 4 — a warp that moves
 
