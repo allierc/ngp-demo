@@ -762,11 +762,15 @@ document.getElementById("decompose").onclick=()=>
 // One shared view for every panel: hovering any of them magnifies all of them
 // about the same point, so the fit, the error and the level grid can be read
 // against each other at the same place rather than eyeballed across panels.
+// Panels the magnifier does not touch. The montage is not the picture -- it is
+// sixteen small pictures side by side, and magnifying "the same point" across a
+// tile grid lands on whichever tile happens to be there.
+const NOZOOM=["c_montage"];
 function view(cv, iw, ih){
   const s0=Math.min(cv.width/iw, cv.height/ih);
   // With "reference fixed" the first panel stays whole and acts as a navigator;
   // otherwise every panel magnifies together.
-  if(!ZOOM.on || (cv.id==="c_ref" && ZOOM.refFixed))
+  if(!ZOOM.on || NOZOOM.includes(cv.id) || (cv.id==="c_ref" && ZOOM.refFixed))
     return {s:s0, ox:(cv.width-iw*s0)/2, oy:(cv.height-ih*s0)/2, s0};
   const s=s0*ZOOM.f;
   return {s, ox:cv.width/2-ZOOM.u*iw*s, oy:cv.height/2-ZOOM.v*ih*s, s0};
@@ -775,8 +779,9 @@ function redrawAll(){
   PANELS.forEach(id=>{ if(id==="c_levels") drawLevels(LASTBLOCKS);
                        else if(IMG[id]) blit(document.getElementById(id).getContext("2d"),
                                              document.getElementById(id), IMG[id]); });
-  if(IMG["c_effmap"]) blit(document.getElementById("c_effmap").getContext("2d"),
-                           document.getElementById("c_effmap"), IMG["c_effmap"]);
+  ["c_effmap","c_montage"].forEach(id=>{ if(IMG[id])
+    blit(document.getElementById(id).getContext("2d"),
+         document.getElementById(id), IMG[id]); });
 }
 // Every panel can drive the magnifier; with "reference fixed" only the first
 // one does, so the whole picture stays available to point at.
@@ -821,7 +826,10 @@ function blit(g,cv,im){
   g.fillStyle="#000"; g.fillRect(0,0,cv.width,cv.height);
   const v=view(cv, im.width, im.height);
   // Nearest-neighbour once magnified, so the pixels are visible as pixels.
-  g.imageSmoothingEnabled = !ZOOM.on || (cv.id==="c_ref" && ZOOM.refFixed);
+  // Never smooth the montage: its tiles are nearest-neighbour blow-ups of each
+  // level's own grid, and smoothing them back is undoing the point.
+  g.imageSmoothingEnabled = NOZOOM.includes(cv.id) ? false
+    : (!ZOOM.on || (cv.id==="c_ref" && ZOOM.refFixed));
   g.drawImage(im, v.ox, v.oy, im.width*v.s, im.height*v.s);
   if(cv.id==="c_ref" && ZOOM.on && ZOOM.refFixed)
     drawViewport(g, cv, im.width, im.height, v);
