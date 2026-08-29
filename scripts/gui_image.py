@@ -482,8 +482,8 @@ on quality against time and against parameter count.</p>
 </div>
 <div id="zoomnote" class="note"></div>
 <div id="levlegend" class="note"></div>
-<div class="row" style="margin-top:18px">
-  <div class="panel"><canvas id="c_curve" width="520" height="460"></canvas>
+<div class="row grid4" style="margin-top:18px">
+  <div class="panel span2"><canvas id="c_curve" width="700" height="460"></canvas>
     <div class="cap">psnr against training time &mdash; this run and the last few</div></div>
   <div class="panel"><canvas id="c_effmap" width="330" height="460"></canvas>
     <div class="cap">effective level per pixel &mdash; same 0&ndash;20 scale</div></div>

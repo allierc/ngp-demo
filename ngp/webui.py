@@ -138,6 +138,15 @@ CSS = """
   .row.equal { flex-wrap:nowrap; }
   .row.equal .panel { flex:1 1 0; min-width:0; }
   .row.equal canvas { width:100%; height:auto; }
+  /* Four columns on the same track as a four-panel .row.equal above it: same
+     gap, same 1fr columns, so a panel here lines up with the panel above it
+     however wide the window is.  A flex row cannot do this -- its free space is
+     split after removing ITS OWN gaps, so a row of three lands ~9 px off. */
+  .row.grid4 { display:grid; grid-template-columns:repeat(4, 1fr); gap:18px;
+               align-items:start; }
+  .row.grid4 .panel { min-width:0; }
+  .row.grid4 .span2 { grid-column:span 2; }
+  .row.grid4 canvas { width:100%; height:auto; }
   .cap { font-size:10px; letter-spacing:.14em; text-transform:uppercase;
          color:var(--dim); }
   .cap i { color:var(--red); font-style:normal; }
