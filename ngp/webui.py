@@ -45,6 +45,24 @@ LEVEL_RAMP = LinearSegmentedColormap.from_list(
                (1.00, 0.82, 0.30), (1.00, 0.42, 0.42)])
 
 
+# Diverging, through black rather than white: these panels sit on a black page,
+# so zero should read as "nothing here" and not as the brightest thing in the
+# frame.  Blue negative, red positive, symmetric about zero.
+SIGNED_RAMP = LinearSegmentedColormap.from_list(
+    "signed", [(0.25, 0.55, 1.00), (0.10, 0.20, 0.45), (0.00, 0.00, 0.00),
+               (0.45, 0.12, 0.12), (1.00, 0.30, 0.28)])
+
+
+def signed_rgb(a: np.ndarray, vmax: float) -> np.ndarray:
+    """Signed data on a symmetric +-vmax scale -> uint8 RGB."""
+    x = np.clip(a / max(vmax, 1e-6), -1.0, 1.0) * 0.5 + 0.5
+    return (SIGNED_RAMP(x)[..., :3] * 255).astype(np.uint8)
+
+
+def signed_png(a: np.ndarray, vmax: float, max_h: int = DISPLAY_H) -> str:
+    return png_data_uri(signed_rgb(a, vmax), max_h)
+
+
 def cmap_png(a: np.ndarray, vmax: float, name="inferno", max_h: int = DISPLAY_H) -> str:
     x = np.clip(a / max(vmax, 1e-6), 0, 1)
     cmap = LEVEL_RAMP if name == "levels" else matplotlib.colormaps[name]

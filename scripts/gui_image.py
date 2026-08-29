@@ -42,7 +42,7 @@ from ngp.utils import BilinearImage, pixel_centers, psnr, read_image, render
 from PIL import Image, ImageDraw
 
 from ngp.webui import ABOUT_HTML, CSS, INTERFACE_IMAGE, cmap_png, gray_png,\
-    png_data_uri
+    png_data_uri, signed_rgb
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_IMAGE = os.path.join(ROOT, "assets/girl_with_a_pearl_earring.jpg")
@@ -206,8 +206,8 @@ MODEL = {"model": None, "shape": None}
 # in the state payload on every poll, and three of them would be three times the
 # bytes for two views nobody is looking at.
 DECOMP = {"mode": "adds", "side": 110}
-# |what level l adds| on a fixed scale, so a panel darkens as the level's
-# contribution shrinks instead of rescaling to its own maximum.
+# What level l adds, on a fixed symmetric scale, so a panel darkens as the
+# level's contribution shrinks instead of rescaling to its own maximum.
 DECOMP_LUT_MAX = 0.10
 
 
@@ -223,7 +223,7 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
 
     mode="alone"  the MLP fed by that level and nothing else
         "upto"    levels 0..l, the fit as it stands at that resolution
-        "adds"    |upto(l) - upto(l-1)|, what releasing the level changed
+        "adds"    upto(l) - upto(l-1), what releasing the level changed, signed
     """
     h, w, c = shape
     sub = max(1, int(round(max(h, w) / side)))
@@ -249,8 +249,12 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
                 img = upto(l)
                 rgb, amp = _u8(img), float(img.std())
             elif mode == "adds":
-                d = (upto(l) - upto(l - 1)).abs().mean(-1)
-                rgb, amp = _heat(d, DECOMP_LUT_MAX), float(d.mean())
+                # SIGNED, not |.|: a level that darkens a region and one that
+                # brightens it are doing opposite things, and the magnitude
+                # alone paints them the same colour.
+                d = (upto(l) - upto(l - 1)).mean(-1)
+                rgb, amp = signed_rgb(d.cpu().numpy(), DECOMP_LUT_MAX), \
+                    float(d.abs().mean())
             else:
                 g = torch.zeros_like(enc.level_gain)
                 g[l] = 1.0
@@ -268,11 +272,6 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
 
 def _u8(t):
     return (np.clip(t.detach().cpu().numpy(), 0, 1) * 255).astype(np.uint8)
-
-
-def _heat(t, vmax):
-    x = np.clip(t.detach().cpu().numpy() / max(vmax, 1e-6), 0, 1)
-    return (matplotlib.colormaps["inferno"](x)[..., :3] * 255).astype(np.uint8)
 
 
 def montage_png(out, cols=4, gap=2, label=True):
@@ -663,7 +662,7 @@ document.getElementById("stop").onclick=()=>fetch("/api/stop");
 document.getElementById("clear").onclick=async()=>{ await fetch("/api/clear"); poll(); };
 // The live montage: one server-side mode, switched here, redrawn on the next
 // refresh of the fit.
-const DECMODES=[["adds","what it adds"],["alone","the level alone"],
+const DECMODES=[["adds","what it adds (\u00b1)"],["alone","the level alone"],
                 ["upto","levels 0..l"]];
 let decmode="adds";
 (function(){
@@ -955,14 +954,16 @@ async function draw(){
   document.getElementById("note").innerHTML=
     `${r.panels.length} of ${r.n_levels} levels, the finest ones, rendered at `
    +`${r.render}` + (mode==="adds"
-      ? ` &mdash; |level l minus level l-1|, fixed scale 0&ndash;__DMAX__`
+      ? ` &mdash; level l minus level l-1, <span style="color:#4a8bff">blue`
+       +`</span> negative, black zero, <span style="color:#ff4b47">red</span> `
+       +`positive, fixed scale &plusmn;__DMAX__`
       : ``);
   document.getElementById("mont").innerHTML = r.panels.map(p=>
     `<div class="cell"><img src="${p.png}">`
    +`<div class="lab">L${p.level} &middot; ${p.cells} cells &middot; `
    +`${p.px_per_cell} px/cell &middot; `
    +`<span class="${p.dense?"":"hash"}">${p.dense?"dense":"hashed"}</span>`
-   +` &middot; ${mode==="adds"?"mean":"std"} ${p.amp.toFixed(4)}</div></div>`
+   +` &middot; ${mode==="adds"?"mean |&Delta;|":"std"} ${p.amp.toFixed(4)}</div></div>`
   ).join("");
 }
 paint(); draw();
