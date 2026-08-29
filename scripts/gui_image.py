@@ -21,6 +21,7 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -95,16 +96,25 @@ def image_shape(path, down):
 def build(p, shape):
     """The NGPField a given set of controls asks for, plus its resolution ladder."""
     h, w, c = shape
-    max_res = (w, h) if int(p["max_resolution"]) <= 0 else int(p["max_resolution"])
+    n_lv = int(p["n_levels"])
+    n_min = int(FIXED["base_resolution"])
+    max_res = ((w, h) if int(p["max_resolution"]) <= 0
+               else (int(p["max_resolution"]),) * 2)
+    # Equation 3 of the paper: b is DERIVED from the two ends and L, not set.
+    # It was a knob, and a knob it should not be -- b, N_max and L are three
+    # ways of saying two things, and the third silently loses to the cap.
+    scale = tuple(math.exp((math.log(max(m, n_min + 1)) - math.log(n_min))
+                           / max(1, n_lv - 1)) for m in max_res)
     kwargs = dict(
         n_input_dims=2, n_output_dims=c,
-        n_neurons=int(p["n_neurons"]), n_hidden_layers=int(p["n_hidden_layers"]),
-        activation=p["activation"], output_activation="sigmoid",
-        n_levels=int(p["n_levels"]), n_features_per_level=int(p["n_features"]),
+        n_neurons=int(FIXED["n_neurons"]),
+        n_hidden_layers=int(FIXED["n_hidden_layers"]),
+        activation=FIXED["activation"], output_activation="sigmoid",
+        n_levels=n_lv, n_features_per_level=int(FIXED["n_features"]),
         log2_hashmap_size=int(p["log2_hashmap_size"]),
-        base_resolution=int(p["base_resolution"]),
-        per_level_scale=float(p["per_level_scale"]),
-        max_resolution=max_res, interpolation=p["interpolation"])
+        base_resolution=n_min, per_level_scale=scale,
+        max_resolution=max_res, interpolation=FIXED["interpolation"],
+        hash_shuffle=str(p["hash_shuffle"]) in ("1", "1.0", "xor primes", "True"))
     model = NGPField(**kwargs)
     enc = model.encoding
     ladder = [{"level": i, "rx": enc.resolutions[i][0], "ry": enc.resolutions[i][1],
@@ -324,15 +334,15 @@ def train_job(p, device):
         model = model.to(device)
         MODEL["model"], MODEL["shape"] = model, shape
         info = describe(model, shape)
-        label = (f"L{int(p['n_levels'])} F{int(p['n_features'])} "
-                 f"T2^{int(p['log2_hashmap_size'])} "
-                 f"{'auto' if int(p['max_resolution']) <= 0 else int(p['max_resolution'])} "
-                 f"{p['interpolation'][:6]}")
-        print(f"[run] L{int(p['n_levels'])} F{int(p['n_features'])} "
-              f"T2^{int(p['log2_hashmap_size'])} b{float(p['per_level_scale'])} "
-              f"{p['interpolation']}/{p['activation']}  {int(p['steps'])} steps, "
-              f"lr {float(p['lr']):.1e}, batch {int(p['batch']):,}  -> "
-              f"{info['n_total']:,} params "
+        shuffled = model.encoding.hash_shuffle
+        label = (f"L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
+                 f"{'auto' if int(p['max_resolution']) <= 0 else int(p['max_resolution'])}"
+                 + ("" if shuffled else " raster"))
+        print(f"[run] L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
+              f"Nmax {'auto' if int(p['max_resolution']) <= 0 else int(p['max_resolution'])} "
+              f"b {model.encoding.per_level_scale[0]:.3f} (derived) hash {'xor primes' if shuffled else 'raster mod T'}  "
+              f"{int(p['steps'])} steps, lr {float(p['lr']):.1e}, "
+              f"batch {int(p['batch']):,}  -> {info['n_total']:,} params "
               f"({info['fraction_of_values']*100:.1f}% of the image)", flush=True)
         print(f"[params] {info['n_total']:,} total = {info['n_enc']:,} in the hash "
               f"table ({model.encoding.table.shape[0]:,} entries x "
@@ -432,26 +442,26 @@ def train_job(p, device):
 # levels sharing a lattice and the finest level exactly at the pixel spacing.
 # The same encoder against the full-resolution image reads ~4x smaller, which
 # is why fit_image.py's defaults differ.
+# Table 1 of the paper lists five encoding parameters and says of them: "Only
+# the hash table size T and max. resolution N_max need to be tuned to the task."
+# L, F and N_min are fixed there (16, 2, 16), and b is not a parameter at all --
+# equation 3 derives it from N_min, N_max and L. So those are the knobs here,
+# plus L, which is the one the page is about; everything else is FIXED and lives
+# in the source rather than on a slider nobody should be moving.
+FIXED = {"n_features": 2, "base_resolution": 4, "n_neurons": 64,
+         "n_hidden_layers": 2, "activation": "relu", "interpolation": "linear",
+         "loss": "l2"}
 KNOBS = [
     {"name": "n_levels", "label": "levels L", "min": 2, "max": 20, "default": 18,
      "step": 1},
-    {"name": "n_features", "label": "features per level F", "min": 1, "max": 8,
-     "default": 2, "step": 1},
     # Shown as the entry count rather than the exponent: "2^10" is not a
     # quantity anyone compares against a level's node count by eye, and that
     # comparison is the whole meaning of the knob.
-    {"name": "log2_hashmap_size", "label": "max entries per level", "min": 10,
+    {"name": "log2_hashmap_size", "label": "max entries per level T", "min": 10,
      "max": 24, "default": 10, "step": 1, "pow2": True},
-    {"name": "base_resolution", "label": "coarsest cells per axis", "min": 2,
-     "max": 256, "default": 4, "step": 1},
-    {"name": "per_level_scale", "label": "growth per level b", "min": 1.1,
-     "max": 2.0, "default": 1.35, "step": 0.05},
-    {"name": "max_resolution", "label": "finest cells per axis (0 = the pixel count)",
+    {"name": "max_resolution",
+     "label": "finest cells per axis N_max (0 = the pixel count)",
      "min": 0, "max": 4096, "default": 0, "step": 32},
-    {"name": "n_neurons", "label": "decoder width", "min": 16, "max": 256,
-     "default": 64, "step": 16},
-    {"name": "n_hidden_layers", "label": "decoder hidden layers", "min": 1,
-     "max": 6, "default": 2, "step": 1},
 ]
 TRAIN_KNOBS = [
     {"name": "lr", "label": "learning rate", "min": 1e-4, "max": 1e-1,
@@ -462,8 +472,7 @@ TRAIN_KNOBS = [
      "max": 1048576, "default": 262144, "step": 4096},
 ]
 DEFAULTS = {k["name"]: k["default"] for k in KNOBS + TRAIN_KNOBS}
-DEFAULTS.update(interpolation="linear", activation="relu", loss="l2",
-                downsample=2)
+DEFAULTS.update(FIXED, downsample=2, hash_shuffle=1)
 
 
 PAGE = r"""<!doctype html>
@@ -581,10 +590,24 @@ function seg(name, opts, key, after){
     s.appendChild(b); });
   g.append(l,s); C.appendChild(g);
 }
-seg("interpolation", ["linear","smoothstep"], "interpolation");
-seg("decoder activation", ["relu","gelu","softplus","tanh"], "activation");
-seg("loss", ["relative_l2","l2"], "loss");
 seg("downsample", [1,2,4], "downsample");
+// The one encoder knob that is not in Table 1: whether the index is shuffled at
+// all. Off means the node's raster index modulo T, so the collisions stop being
+// scattered and become periodic.
+(function(){
+  const g=document.createElement("div"); g.className="group";
+  const l=document.createElement("div"); l.className="label";
+  l.textContent="hash index";
+  const sg=document.createElement("div"); sg.className="seg";
+  [["xor primes",1],["raster mod T",0]].forEach(([txt,val])=>{
+    const b=document.createElement("button"); b.textContent=txt;
+    b.setAttribute("aria-pressed", knob.hash_shuffle===val);
+    b.onclick=()=>{ knob.hash_shuffle=val;
+      [...sg.children].forEach(c=>c.setAttribute("aria-pressed", c===b));
+      preview(); };
+    sg.appendChild(b); });
+  g.append(l,sg); C.appendChild(g);
+})();
 // Magnifier mode is a view setting, not a model setting: it must not restart a
 // fit, so it is handled here rather than through the knob object.
 (function(){

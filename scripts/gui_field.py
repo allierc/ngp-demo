@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Browser GUI for the registration benchmark: fit a known warp, watch it converge.
 
-    python scripts/gui.py                 # http://localhost:8021
-    python scripts/gui.py --port 8030
+    python scripts/gui_field.py                 # http://localhost:8021
+    python scripts/gui_field.py --port 8030
 
 Everything the benchmark decides from a YAML file is a control here instead:
 which ground-truth deformation to recover, how mismatched the two "modalities"

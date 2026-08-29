@@ -1,6 +1,6 @@
 """Shared pieces of the two browser UIs: image encoding and the flat stylesheet.
 
-Both `scripts/gui.py` (registration) and `scripts/gui_image.py` (image fitting)
+Both `scripts/gui_field.py` (registration) and `scripts/gui_image.py` (image fitting)
 serve a single self-contained page and poll a JSON endpoint, so the only things
 worth sharing are how a tensor becomes a PNG data URI and what the page looks
 like.
@@ -344,43 +344,40 @@ against the image's own value count, green under 50%, amber under 100%, red once
 your "compression" is an expansion.</p>
 
 <h2>The shape of the encoder</h2>
-<p>These four decide the ladder of scales, and the ladder table below the panels
-shows exactly what they built.</p>
+<p>Table 1 of the paper lists five encoding parameters and then says that only two
+of them need tuning: the table size <code>T</code> and the finest resolution
+<code>N_max</code>. Those are the knobs here, plus <code>L</code>. The rest &mdash;
+<code>F</code>&nbsp;=&nbsp;2 features per level, <code>N_min</code>&nbsp;=&nbsp;4
+cells, a 64-wide 2-layer decoder, linear interpolation, L2 loss &mdash; are fixed in
+the source, and the growth factor <code>b</code> is not a setting at all: equation 3
+derives it from the two ends and <code>L</code>, so the ladder always lands exactly
+on <code>N_max</code>. The ladder table below the panels shows what they built.</p>
 <ul>
-<li><b>coarsest cells per axis</b> and <b>growth per level b</b> &mdash; where the
-ladder starts and how fast it climbs, <code>N_l = N_min * b^l</code>.</li>
-<li><b>levels L</b> &mdash; how many rungs. Two rungs that land on the same lattice
-are wasted: they are separate feature sets on identical nodes, which
-<b>features per level F</b> buys more directly.</li>
-<li><b>finest cells per axis</b> &mdash; where the ladder stops. 0 means the image's
-own pixel count. Going finer than the pixel spacing buys almost no PSNR, costs
-parameters, and shows up as noise in any derivative taken through the fit.</li>
+<li><b>levels L</b> &mdash; how many rungs between <code>N_min</code> and
+<code>N_max</code>. More rungs means a gentler <code>b</code>, and two rungs that
+land on the same lattice are wasted: they are separate feature sets on identical
+nodes.</li>
+<li><b>max entries per level T</b> &mdash; shown as the entry count rather than the
+exponent. A level with fewer nodes than this stores every node separately and the
+knob does nothing; a level with more folds its nodes through the hash and starts
+sharing entries. The line under the ladder gives the comparison directly: how many
+nodes the finest level wants against how many it may hold, and how many levels
+collide as a result.</li>
+<li><b>finest cells per axis N_max</b> &mdash; where the ladder stops. 0 means the
+image's own pixel count. Going finer than the pixel spacing buys almost no PSNR,
+costs parameters, and shows up as noise in any derivative taken through the fit.</li>
 </ul>
 
-<h2>What a level may cost</h2>
+<h2>The one knob that is not in the paper's table</h2>
 <ul>
-<li><b>max entries per level</b> &mdash; the table size <code>T</code>, shown as the
-entry count rather than the exponent. A level with fewer nodes than this stores every
-node separately and the knob does nothing; a level with more folds its nodes through
-the hash and starts sharing entries. The line under the ladder gives the comparison
-directly: how many nodes the finest level wants against how many it may hold, and how
-many levels collide as a result.</li>
-<li><b>features per level F</b> &mdash; width per scale. Doubling it doubles the
-table.</li>
-</ul>
-
-<h2>The decoder</h2>
-<ul>
-<li><b>decoder width</b> and <b>hidden layers</b> &mdash; the MLP that turns the
-concatenated features into RGB. Small on purpose: the table is meant to carry the
-signal.</li>
-<li><b>interpolation</b> &mdash; linear is the paper's default and only C0.
-Smoothstep replaces the weight w by 3w^2-2w^3, making the encoding C1, which you need
-if anything downstream takes a second derivative.</li>
-<li><b>decoder activation</b> &mdash; relu matches the paper; gelu and softplus are
-smooth, and for the same reason.</li>
-<li><b>loss</b> &mdash; relative L2 is instant-NGP's, and weights dark pixels up by
-dividing by the prediction's own magnitude. Plain l2 does not.</li>
+<li><b>hash index</b> &mdash; <i>xor primes</i> is instant-NGP's spatial hash: the
+node's integer coordinates are multiplied by large primes and XORed together, so two
+nodes that share a row are in unrelated places, and the paper's whole argument rests
+on that ("collisions are pseudo-randomly scattered across space, and statistically
+unlikely to occur simultaneously at every level"). <i>raster mod T</i> throws the
+shuffle away and indexes by the node's plain raster number modulo T. The collisions
+then repeat on a fixed stride instead of scattering, and they line up level after
+level. Switch it and watch the error panel.</li>
 <li><b>downsample</b> &mdash; 1, 2 or 4. It changes the reference the compression
 figure is measured against, so the same encoder reads four times larger at
 downsample 2.</li>
@@ -396,6 +393,14 @@ block's strongest contribution, and drawn with that level's cells <i>if</i> they
 at least 3 screen pixels. At 1 px per finest cell nothing is drawable, so every
 block tints and only the colours carry information. Lower <b>finest cells per
 axis</b> to see real cells. It shows signal versus none, not local scale.</li>
+<li><b>the 16 finest levels</b> &mdash; the encoder taken apart while it trains. By
+default each tile is what that level <i>adds</i>, signed: blue negative, black zero,
+red positive, on a fixed &plusmn;0.1. The first tile is the baseline the differences
+start from, and it is not black &mdash; fed an all-zero feature vector the decoder
+returns a mid grey, which is why the dark background is corrected downwards by level
+after level with nothing to compensate. Baseline plus the differences is the fit.
+<b>decompose</b> opens the same thing full size, with a view that puts one level
+through the decoder alone.</li>
 <li><b>psnr against training time</b> &mdash; finished runs stay, colour-keyed to the
 table beside them, so settings compare on quality against time and parameters.</li>
 <li><b>magnifier</b> &mdash; hover to magnify; with <i>reference fixed</i> the first

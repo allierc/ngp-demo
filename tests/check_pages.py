@@ -26,7 +26,7 @@ PY = sys.executable
 # is a second document with its own script, and an error in it is just as
 # invisible as one in the main page.
 PAGES = [
-    ("scripts/gui.py", 8931, [("/", True, True)]),
+    ("scripts/gui_field.py", 8931, [("/", True, True)]),
     ("scripts/gui_image.py", 8932, [("/", True, True), ("/decompose", False, False)]),
     ("scripts/gui_time.py", 8933, [("/", True, True)]),
 ]

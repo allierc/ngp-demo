@@ -60,6 +60,14 @@ class MultiResHashGrid(nn.Module):
             Scalar or one value per axis.
         max_resolution: cells per axis the refinement stops at.
             Scalar or one value per axis; None means unbounded.
+        hash_shuffle: True uses instant-NGP's spatial hash, the XOR of the
+            per-axis coordinates times large primes.  False indexes the level's
+            slice of the table by the node's plain raster index modulo T -- no
+            shuffling at all.  The paper relies on collisions being
+            "pseudo-randomly scattered across space"; without the shuffle they
+            are not scattered at all, they are periodic, and two points a fixed
+            stride apart share a row at every fine level at once.  This is the
+            knob that shows what the primes are for.
         interpolation: "linear" (C^0) or "smoothstep" (C^1, needed for
             second derivatives through the encoding), or one such string per
             axis.  Smoothstep is not free: its weight derivative 6w(1-w)
@@ -81,6 +89,7 @@ class MultiResHashGrid(nn.Module):
         per_level_scale: float | Sequence[float] = 1.5,
         max_resolution: int | Sequence[float] | None = None,
         interpolation: str | Sequence[str] = "linear",
+        hash_shuffle: bool = True,
     ):
         super().__init__()
         if not 1 <= n_input_dims <= 4:
@@ -97,6 +106,7 @@ class MultiResHashGrid(nn.Module):
         self.n_features_per_level = n_features_per_level
         self.n_output_dims = n_levels * n_features_per_level
         self.interpolation = interpolation
+        self.hash_shuffle = bool(hash_shuffle)
         self._interp = interp
         self._smooth_dims = [d for d, i in enumerate(interp) if i == "smoothstep"]
 
@@ -123,6 +133,7 @@ class MultiResHashGrid(nn.Module):
             dense.append(is_dense)
             offsets.append(offset)
             offset += n_nodes if is_dense else table_size
+        self.per_level_scale = scale          # as REQUESTED; resolutions round
         self.resolutions = resolutions
         self.dense = dense
         self.level_offsets = offsets
@@ -164,7 +175,8 @@ class MultiResHashGrid(nn.Module):
             f"D={self.n_input_dims}, L={self.n_levels}, F={self.n_features_per_level}, "
             f"res per axis ({rng}), {n_hash}/{self.n_levels} levels hashed, "
             f"{self.n_entries * self.n_features_per_level / 1e6:.2f}M table params, "
-            f"interp={'/'.join(self._interp)}"
+            f"interp={'/'.join(self._interp)}, "
+            f"hash={'xor primes' if self.hash_shuffle else 'raster mod T'}"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -192,10 +204,15 @@ class MultiResHashGrid(nn.Module):
                     w = torch.where(self._smooth_mask, ws, w)
 
             corners = base.long().unsqueeze(1) + self.corner_offsets  # (B, C, D)
-            if is_dense:
+            if is_dense or not self.hash_shuffle:
+                # The node's raster index.  On a dense level it addresses the
+                # table 1:1; without the shuffle it is taken modulo T instead,
+                # which is the same indexing with the collisions left periodic.
                 idx = torch.zeros(corners.shape[:-1], dtype=torch.int64, device=x.device)
                 for d in range(D):
                     idx = idx * (res[d] + 1) + corners[..., d]
+                if not is_dense:
+                    idx = idx % self._table_size(lvl)
             else:
                 idx = _hash(corners, self._table_size(lvl))
 

@@ -2,7 +2,7 @@
 
 An instant-NGP encoder (Müller et al. 2022) written with nothing but autograd ops:
 no `tinycudann`, no CUDA extension, no build step. It fits a 3.9 Mpixel painting in
-under a minute on one A6000, fits a time-evolving 2D field and is scored at times it
+one to two minutes on one A6000, fits a time-evolving 2D field and is scored at times it
 never saw, and then hands you the derivatives of the fit with respect to its own
 input coordinates — verified against ground truth rather than asserted.
 
@@ -24,7 +24,7 @@ what any setting does, because the panels update while the fit runs.
 
 ```bash
 python scripts/gui_image.py     # http://localhost:8022  -- fit the painting
-python scripts/gui.py           # http://localhost:8021  -- recover a known warp
+python scripts/gui_field.py           # http://localhost:8021  -- recover a known warp
 python scripts/gui_time.py      # http://localhost:8024  -- a warp that moves
 ```
 
@@ -38,7 +38,7 @@ levels, by default `|levels 0..l| - |levels 0..l-1|`, so you watch the coarse le
 lay down blobs and the fine ones sharpen edges. The **decompose** button opens the
 same thing full size, with a view that puts one level through the decoder alone.
 
-`gui.py` warps the painting by a known analytic field and asks a hash grid or a
+`gui_field.py` warps the painting by a known analytic field and asks a hash grid or a
 control grid to recover it, scoring the *field* rather than the pixels. It
 starts fitting the default configuration as soon as you open it.
 
@@ -56,7 +56,7 @@ the setup line next to the settings that produced it.
 ## Run it
 
 ```bash
-python scripts/fit_image.py                                   # stage 1, ~55 s
+python scripts/fit_image.py                                   # stage 1, ~100 s
 python scripts/fit_field.py --interpolation smoothstep_xy     # stage 2, ~80 s
 python scripts/fit_field.py --isotropic                       # the control
 python scripts/compare_time.py                                # stage 2 figure
@@ -133,17 +133,27 @@ pip install torch numpy pillow matplotlib imageio imageio-ffmpeg pyyaml tensorst
 
 `f(x, y) -> RGB`, trained on uniformly random coordinates against a bilinear lookup
 into the reference. No hold-out: this is the compression/fit benchmark, not a
-generalization test.
+generalization test. 2000 steps, L = 16, F = 2, N_min = 16, T = 2^19:
 
 | finest level | parameters | PSNR after 2000 steps |
 |---|---|---|
-| capped at the pixel count, 1808 × 2138 | 5.92 M (51% of the 11.6 M RGB values) | **40.28 dB** |
-| uncapped, 7006 cells per axis | 7.66 M | 39.54 dB |
+| capped at the pixel count, 1808 × 2138 (b = 1.40) | 5.92 M (51% of the 11.6 M RGB values) | 33.06 dB |
+| uncapped, 2489 cells per axis (b = 1.40) | 5.92 M | 33.03 dB |
+| uncapped, 7006 cells per axis (b = 1.50) | 7.66 M | **33.96 dB** |
 
-Capping the refinement at the data's own sampling is both smaller *and* better: the
-levels below the pixel spacing were spending parameters on structure no sample
-constrains, and the cost of that shows up in the derivatives of the fit
-rather than in its PSNR.
+Capping the refinement at the data's own sampling costs **nothing** against an equally
+fast ladder (rows 1 and 2 differ by 0.03 dB and not at all in size, because the table
+caps both), and **0.90 dB** against a ladder that climbs faster and spends 29% more
+parameters getting past the pixel spacing.
+
+These numbers replace an earlier table that read 40.28 dB against 39.54 and concluded
+that capping was smaller *and* better. That conclusion was an artefact: `BilinearImage`
+looked the reference up half a pixel off, so the training target was a half-pixel box
+blur of the painting and the PSNR was quoted against the blur. On the same fit that
+reads 45.91 dB against the blurred target and 31.18 dB against the actual pixels. With
+the lookup fixed, over-refining is *mildly useful* for PSNR, and the case for capping
+rests on the parameter count and on the derivatives -- stage 3 measures 34x fewer
+parameters and 64x less bending energy at equal endpoint error.
 
 ## Stage 2 — a time-evolving field, scored on times it never saw
 
@@ -178,7 +188,7 @@ and the 24 px band between them. 35 runs; `scripts/summarise.py` merges them.
 ```bash
 python scripts/run_registration.py            # the grid
 python scripts/summarise.py                   # merge + figure
-python scripts/gui.py                         # or drive it in a browser
+python scripts/gui_field.py                         # or drive it in a browser
 ```
 
 Matched-intensity arm, endpoint error in pixels (foreground / band / background):
