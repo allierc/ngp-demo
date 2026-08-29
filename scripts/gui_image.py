@@ -246,7 +246,6 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
     h, w, c = shape
     sub = max(1, int(round(max(h, w) / side)))
     hs, ws = max(8, h // sub), max(8, w // sub)
-    coords = pixel_centers(hs, ws, device)
     enc = model.encoding
     keep = enc.level_gain.clone()
     # "adds" spends one of its tiles on the baseline, so it differences one
@@ -254,45 +253,75 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
     levels = list(range(enc.n_levels))[-(n_panels - 1 if mode == "adds" else n_panels):]
     cache, panels = {}, []
 
-    def upto(k):
-        if k not in cache:
+    def grid_for(l):
+        """EACH LEVEL ON ITS OWN GRID: one sample per node, up to the tile size.
+
+        Rendering every level at the tile resolution and letting the display
+        interpolate hides the thing the montage is for -- a level with 6 cells
+        across the picture drew a smooth blur that looked like a choice the
+        encoder had made, when the truth is that it has six values to spend.
+        Sampled at its own nodes and blown up with nearest-neighbour, a coarse
+        level reads as the handful of blocks it actually is, and the tiles stop
+        being comparable in resolution, which is the point.
+        """
+        return (min(hs, int(enc.resolutions[l][1]) + 1),
+                min(ws, int(enc.resolutions[l][0]) + 1))
+
+    def render_at(k, ny, nx):
+        """levels 0..k, sampled on an (ny, nx) grid.  k = -1 is every level off."""
+        key = (k, ny, nx)
+        if key not in cache:
             g = torch.zeros_like(enc.level_gain)
             if k >= 0:
                 g[:k + 1] = 1.0
             enc.level_gain.copy_(g)
-            cache[k] = render(model, coords, (hs, ws, c)).clamp(0, 1)
-        return cache[k]
+            cache[key] = render(model, pixel_centers(ny, nx, device),
+                                (ny, nx, c)).clamp(0, 1)
+        return cache[key]
+
+    def blow_up(rgb):
+        if rgb.shape[:2] == (hs, ws):
+            return rgb
+        return np.asarray(Image.fromarray(rgb).resize((ws, hs), Image.NEAREST))
 
     try:
         if mode == "adds" and levels[0] > 0:
-            b = upto(levels[0] - 1)
-            panels.append({"level": levels[0] - 1, "label": f"0..{levels[0]-1}",
-                           "cells": int(enc.resolutions[levels[0] - 1][0]),
-                           "px_per_cell": round(w / enc.resolutions[levels[0] - 1][0], 2),
-                           "dense": bool(enc.dense[levels[0] - 1]),
-                           "amp": float(b.mean()), "kind": "base", "rgb": _u8(b)})
+            l0 = levels[0] - 1
+            ny, nx = grid_for(l0)
+            b = render_at(l0, ny, nx)
+            panels.append({"level": l0, "label": f"0..{l0}",
+                           "cells": int(enc.resolutions[l0][0]),
+                           "px_per_cell": round(w / enc.resolutions[l0][0], 2),
+                           "dense": bool(enc.dense[l0]), "amp": float(b.mean()),
+                           "kind": "base", "grid": f"{nx}x{ny}",
+                           "rgb": blow_up(_u8(b))})
         for l in levels:
+            ny, nx = grid_for(l)
             if mode == "upto":
-                img = upto(l)
+                img = render_at(l, ny, nx)
                 rgb, amp = _u8(img), float(img.std())
             elif mode == "adds":
                 # SIGNED, not |.|: a level that darkens a region and one that
                 # brightens it are doing opposite things, and the magnitude
-                # alone paints them the same colour.
-                d = (upto(l) - upto(l - 1)).mean(-1)
+                # alone paints them the same colour.  Both renders on THIS
+                # level's grid, so the difference is between two samplings of
+                # the same points.
+                d = (render_at(l, ny, nx) - render_at(l - 1, ny, nx)).mean(-1)
                 rgb, amp = signed_rgb(d.cpu().numpy(), DECOMP_LUT_MAX), \
                     float(d.abs().mean())
             else:
                 g = torch.zeros_like(enc.level_gain)
                 g[l] = 1.0
                 enc.level_gain.copy_(g)
-                img = render(model, coords, (hs, ws, c)).clamp(0, 1)
+                img = render(model, pixel_centers(ny, nx, device),
+                             (ny, nx, c)).clamp(0, 1)
                 rgb, amp = _u8(img), float(img.std())
             panels.append({"level": l, "label": f"L{l}",
                            "cells": int(enc.resolutions[l][0]),
                            "px_per_cell": round(w / enc.resolutions[l][0], 2),
                            "dense": bool(enc.dense[l]), "amp": amp,
-                           "kind": mode, "rgb": rgb})
+                           "kind": mode, "grid": f"{nx}x{ny}",
+                           "rgb": blow_up(rgb)})
     finally:
         enc.level_gain.copy_(keep)
     return {"panels": panels, "mode": mode, "n_levels": enc.n_levels,
@@ -1008,6 +1037,7 @@ async function draw(){
   document.getElementById("mont").innerHTML = r.panels.map(p=>
     `<div class="cell"><img src="${p.png}">`
    +`<div class="lab">${p.label} &middot; ${p.cells} cells &middot; `
+   +`sampled ${p.grid} &middot; `
    +`${p.px_per_cell} px/cell &middot; `
    +`<span class="${p.dense?"":"hash"}">${p.dense?"dense":"hashed"}</span>`
    +` &middot; ${p.kind==="base" ? "the baseline, mean" :

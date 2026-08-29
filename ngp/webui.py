@@ -399,8 +399,10 @@ red positive, on a fixed &plusmn;0.1. The first tile is the baseline the differe
 start from, and it is not black &mdash; fed an all-zero feature vector the decoder
 returns a mid grey, which is why the dark background is corrected downwards by level
 after level with nothing to compensate. Baseline plus the differences is the fit.
-<b>decompose</b> opens the same thing full size, with a view that puts one level
-through the decoder alone.</li>
+Each tile is sampled on <i>its own</i> level's grid, one sample per node, and blown
+up with nearest-neighbour, so a level with ten cells across the picture reads as ten
+blocks rather than as a smooth blur the display invented. <b>decompose</b> opens the
+same thing full size, with a view that puts one level through the decoder alone.</li>
 <li><b>psnr against training time</b> &mdash; finished runs stay, colour-keyed to the
 table beside them, so settings compare on quality against time and parameters.</li>
 <li><b>magnifier</b> &mdash; hover to magnify; with <i>reference fixed</i> the first
