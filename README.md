@@ -32,7 +32,10 @@ python scripts/gui_time.py      # http://localhost:8024  -- a warp that moves
 setting *builds* before you spend a minute training it: the resolution ladder
 level by level, which levels have to hash, the parameter count against the
 image's own value count. Finished runs stay on the curve, so settings compare
-directly on quality against time and parameters.
+directly on quality against time and parameters. Its **decompose** button opens a
+second window with a 4x4 montage of the 16 finest levels, each rendered with that
+level left on and every other level's features zeroed -- one table per level, so
+one picture per level.
 
 `gui.py` warps the painting by a known analytic field and asks a hash grid or a
 control grid to recover it, scoring the *field* rather than the pixels. It
@@ -59,7 +62,7 @@ python scripts/compare_time.py                                # stage 2 figure
 python scripts/demo_gradients.py                              # derivatives of a fit
 python tests/test_ngp.py                                      # 9 passed
 python tests/level_specialisation.py                          # the negative result
-python tests/check_pages.py                                   # all 3 GUI pages, needs node
+python tests/check_pages.py                                   # 4 pages, needs node
 python scripts/collision_audit.py                             # who wins a collision
 ```
 

@@ -21,7 +21,15 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
-PAGES = [("scripts/gui.py", 8931), ("scripts/gui_image.py", 8932)]
+# (script, port, [(path, expects a fit to start on load, feed it a populated
+# state)]).  A server can serve more than one page: gui_image's decompose window
+# is a second document with its own script, and an error in it is just as
+# invisible as one in the main page.
+PAGES = [
+    ("scripts/gui.py", 8931, [("/", True, True)]),
+    ("scripts/gui_image.py", 8932, [("/", True, True), ("/decompose", False, False)]),
+    ("scripts/gui_time.py", 8933, [("/", True, True)]),
+]
 
 # A realistic /api/state payload. The empty state exercises none of the drawing
 # code, which is where a page actually breaks.
@@ -76,7 +84,7 @@ function el(id) {
   const e = {
     id: id || "", innerHTML: "", textContent: "", value: 0, type: "",
     width: 330, height: 460, style: {},
-    children: [], className: "", checked: false,
+    children: [], className: "", checked: false, dataset: {},
     classList: {add: noop, remove: noop, toggle: noop, contains: () => false},
     appendChild: c => { e.children.push(c); return c; },
     append: (...c) => { e.children.push(...c); },
@@ -109,7 +117,8 @@ global.fetch = (u) => { global.CALLS.push(String(u));
   return Promise.resolve({json: () => Promise.resolve({
   running: false, step: 0, steps: 0, seconds: 0, curve: [], metrics: {},
   images: {}, grid: {}, blocks: {}, ladder: [], history: [], note: "",
-  stamp: 0, info: {}})}); };
+  stamp: 0, info: {}, levels: {}, frames: [0, 1, 2], per_frame: [],
+  panels: [], n_levels: 18, render: "301x356"})}); };
 global.setInterval = () => 0;
 global.clearInterval = noop;
 global.setTimeout = (f) => 0;
@@ -124,11 +133,10 @@ process.on("exit", () => {
 """
 
 
-def check(script: str, port: int) -> bool:
+def check(script: str, port: int, paths) -> bool:
     proc = subprocess.Popen([PY, "-u", os.path.join(ROOT, script), "--port", str(port)],
                             cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        html = None
         for _ in range(40):
             time.sleep(1.0)
             if proc.poll() is not None:
@@ -136,44 +144,51 @@ def check(script: str, port: int) -> bool:
                       f"{proc.stderr.read().decode()[-300:]}")
                 return False
             try:
-                html = urllib.request.urlopen(f"http://127.0.0.1:{port}/",
-                                              timeout=2).read().decode()
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2).read()
                 break
             except Exception:
                 continue
-        if html is None:
+        else:
             print(f"  {script}: server never answered")
             return False
-        left = [t for t in re.findall(r"__[A-Z_]+__", html)]
-        if left:
-            print(f"  {script}: unreplaced placeholders {sorted(set(left))}")
-            return False
-        # The explainer is a modal. Without the rule that hides it, it renders
-        # inline and pushes the panels off the page -- which looks exactly like
-        # "clicking run does nothing".
-        if 'class="modal"' in html and ".modal { position:fixed" not in html:
-            print(f"  {script}: modal markup present but the stylesheet that "
-                  "hides it is not")
-            return False
-        js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
-        path = f"/tmp/_page_{port}.js"
-        with open(path, "w") as f:
-            # gui.py starts a fit as soon as it opens; assert that it really does.
-            # both pages open on a running fit
-            f.write(STUB + "\nglobal.EXPECT_START = true;\n" + js + "\n" + POPULATED)
-        r = subprocess.run(["node", path], capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            print(f"  {script}: page script threw\n"
-                  + "\n".join(r.stderr.strip().splitlines()[:12]))
-            return False
-        print(f"  {script}: page builds cleanly ({len(js):,} chars of script)")
-        return True
+        return all(check_page(script, port, *p) for p in paths)
     finally:
         proc.terminate()
         proc.wait(timeout=10)
 
 
+def check_page(script, port, path, expect_start, populated) -> bool:
+        name = f"{script}{'' if path == '/' else ' ' + path}"
+        html = urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
+                                      timeout=10).read().decode()
+        left = [t for t in re.findall(r"__[A-Z_]+__", html)]
+        if left:
+            print(f"  {name}: unreplaced placeholders {sorted(set(left))}")
+            return False
+        # The explainer is a modal. Without the rule that hides it, it renders
+        # inline and pushes the panels off the page -- which looks exactly like
+        # "clicking run does nothing".
+        if 'class="modal"' in html and ".modal { position:fixed" not in html:
+            print(f"  {name}: modal markup present but the stylesheet that "
+                  "hides it is not")
+            return False
+        js = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+        out = f"/tmp/_page_{port}{path.replace('/', '_')}.js"
+        with open(out, "w") as f:
+            # every main page opens on a running fit; assert that it really does
+            f.write(STUB
+                    + (f"\nglobal.EXPECT_START = {str(expect_start).lower()};\n")
+                    + js + ("\n" + POPULATED if populated else ""))
+        r = subprocess.run(["node", out], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            print(f"  {name}: page script threw\n"
+                  + "\n".join(r.stderr.strip().splitlines()[:12]))
+            return False
+        print(f"  {name}: page builds cleanly ({len(js):,} chars of script)")
+        return True
+
+
 if __name__ == "__main__":
-    ok = all([check(s, p) for s, p in PAGES])
+    ok = all([check(s, p, paths) for s, p, paths in PAGES])
     print("\nall pages ok" if ok else "\nFAILED")
     sys.exit(0 if ok else 1)

@@ -193,6 +193,70 @@ def level_maps(model, shape, device, block_px=64, sub=3, thresh=0.08):
     return eff.cpu().numpy(), blocks
 
 
+# The decomposition window keeps a handle on the fit so it can be re-rendered
+# after the run ends.  It is deep-copied before its level gains are touched: the
+# gains live on the model the trainer is still stepping.
+MODEL = {"model": None, "shape": None}
+# |what level l adds| on a fixed scale, so a panel darkens as the level's
+# contribution shrinks instead of rescaling to its own maximum.
+DECOMP_LUT_MAX = 0.10
+
+
+@torch.no_grad()
+def decompose(model, shape, device, mode="alone", n_panels=16, side=420):
+    """Render the finest `n_panels` levels one at a time.
+
+    The encoder already carries a per-level gain (`level_gain`, used by the
+    coarse-to-fine window), so a level is isolated by setting that vector to a
+    one-hot: the other levels still occupy their slots in the feature vector,
+    they are simply zero.  There is no separate forward path and nothing is
+    reimplemented here.
+
+    mode="alone"  the MLP fed by that level and nothing else
+        "upto"    levels 0..l, the fit as it stands at that resolution
+        "adds"    |upto(l) - upto(l-1)|, what releasing the level changed
+    """
+    h, w, c = shape
+    sub = max(1, int(round(max(h, w) / side)))
+    hs, ws = max(8, h // sub), max(8, w // sub)
+    coords = pixel_centers(hs, ws, device)
+    enc = model.encoding
+    keep = enc.level_gain.clone()
+    levels = list(range(enc.n_levels))[-n_panels:]
+    cache, panels = {}, []
+
+    def upto(k):
+        if k not in cache:
+            g = torch.zeros_like(enc.level_gain)
+            if k >= 0:
+                g[:k + 1] = 1.0
+            enc.level_gain.copy_(g)
+            cache[k] = render(model, coords, (hs, ws, c)).clamp(0, 1)
+        return cache[k]
+
+    try:
+        for l in levels:
+            if mode == "upto":
+                img = upto(l)
+                png, amp = gray_png(img), float(img.std())
+            elif mode == "adds":
+                d = (upto(l) - upto(l - 1)).abs().mean(-1)
+                png, amp = cmap_png(d.cpu().numpy(), DECOMP_LUT_MAX), float(d.mean())
+            else:
+                g = torch.zeros_like(enc.level_gain)
+                g[l] = 1.0
+                enc.level_gain.copy_(g)
+                img = render(model, coords, (hs, ws, c)).clamp(0, 1)
+                png, amp = gray_png(img), float(img.std())
+            panels.append({"level": l, "cells": int(enc.resolutions[l][0]),
+                           "px_per_cell": round(w / enc.resolutions[l][0], 2),
+                           "dense": bool(enc.dense[l]), "amp": amp, "png": png})
+    finally:
+        enc.level_gain.copy_(keep)
+    return {"panels": panels, "mode": mode, "n_levels": enc.n_levels,
+            "render": f"{ws}x{hs}"}
+
+
 def train_job(p, device):
     try:
         down = max(1, int(p["downsample"]))
@@ -201,6 +265,7 @@ def train_job(p, device):
         torch.manual_seed(0)
         model, ladder = build(p, shape)
         model = model.to(device)
+        MODEL["model"], MODEL["shape"] = model, shape
         info = describe(model, shape)
         label = (f"L{int(p['n_levels'])} F{int(p['n_features'])} "
                  f"T2^{int(p['log2_hashmap_size'])} "
@@ -354,7 +419,8 @@ on quality against time and against parameter count.</p>
 <div class="knobs" id="knobs_train"></div>
 <div class="controls"><div class="group"><div class="label">&nbsp;</div>
   <div class="seg"><button id="run">run</button><button id="stop">stop</button>
-  <button id="clear">clear history</button></div>
+  <button id="clear">clear history</button>
+  <button id="decompose">decompose</button></div>
 </div></div>
 <div class="bar"><i id="prog"></i></div>
 <div class="note" id="note"></div>
@@ -545,6 +611,8 @@ async function startRun(){
 document.getElementById("run").onclick=startRun;
 document.getElementById("stop").onclick=()=>fetch("/api/stop");
 document.getElementById("clear").onclick=async()=>{ await fetch("/api/clear"); poll(); };
+document.getElementById("decompose").onclick=()=>
+  window.open("/decompose", "ngp_decompose", "width=1500,height=1000");
 
 // One shared view for every panel: hovering any of them magnifies all of them
 // about the same point, so the fit, the error and the level grid can be read
@@ -772,6 +840,65 @@ startRun();
 """
 
 
+DECOMP_PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>one level at a time</title>
+<style>__CSS__
+.mont{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+.mont .cell{background:#141414;border:1px solid #262626;padding:6px;text-align:center}
+.mont img{width:100%;display:block;background:#000}
+.mont .lab{font-size:11px;color:#9a9a9a;margin-top:4px}
+.mont .hash{color:#4da3ff}
+</style></head><body><div class="wrap">
+<h1>one level at a time</h1>
+<p class="sub">The encoder holds <b>one table per level</b>. Each panel below is the
+fit rendered with <b>a single level left switched on</b> and every other level's
+features zeroed &mdash; same decoder, same weights, one sixteenth of its input. The
+coarse levels draw a blur because their cells are hundreds of pixels wide; the fine
+ones draw an edge map because their cells are about a pixel. <b>They do not add
+up:</b> the decoder is a nonlinear MLP, so a level alone is not a term of a sum.
+The <i>what level adds</i> view is the honest decomposition &mdash; it differences two
+renders instead of isolating one level.</p>
+<div class="controls"><div class="group"><div class="label">view</div>
+  <div class="seg" id="modes"></div></div>
+<div class="group"><div class="label">&nbsp;</div>
+  <div class="seg"><button id="refresh">refresh from the current fit</button></div>
+</div></div>
+<div class="note" id="note">rendering&hellip;</div>
+<div class="mont" id="mont"></div>
+</div><script>
+const MODES=[["alone","the level alone"],["adds","what the level adds"],
+             ["upto","levels 0..l"]];
+let mode="alone";
+const seg=document.getElementById("modes");
+MODES.forEach(([k,lab])=>{ const b=document.createElement("button");
+  b.textContent=lab; b.onclick=()=>{ mode=k; draw(); paint(); }; b.dataset.k=k;
+  seg.appendChild(b); });
+function paint(){ [...seg.children].forEach(b=>
+  b.setAttribute("aria-pressed", b.dataset.k===mode)); }
+async function draw(){
+  document.getElementById("note").textContent="rendering...";
+  const r=await (await fetch("/api/decompose?mode="+mode)).json();
+  if(r.error){ document.getElementById("note").textContent=r.error;
+               document.getElementById("mont").innerHTML=""; return; }
+  document.getElementById("note").innerHTML=
+    `${r.panels.length} of ${r.n_levels} levels, the finest ones, rendered at `
+   +`${r.render}` + (mode==="adds"
+      ? ` &mdash; |level l minus level l-1|, fixed scale 0&ndash;__DMAX__`
+      : ``);
+  document.getElementById("mont").innerHTML = r.panels.map(p=>
+    `<div class="cell"><img src="${p.png}">`
+   +`<div class="lab">L${p.level} &middot; ${p.cells} cells &middot; `
+   +`${p.px_per_cell} px/cell &middot; `
+   +`<span class="${p.dense?"":"hash"}">${p.dense?"dense":"hashed"}</span>`
+   +` &middot; ${mode==="adds"?"mean":"std"} ${p.amp.toFixed(4)}</div></div>`
+  ).join("");
+}
+paint(); draw();
+document.getElementById("refresh").onclick=draw;
+</script></body></html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     device = None
 
@@ -802,6 +929,30 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
                         .replace("__ERRMAX__", f"{ERROR_LUT_MAX:g}"))
             return self._send(page, "text/html; charset=utf-8")
+        if u.path == "/decompose":
+            return self._send(DECOMP_PAGE.replace("__CSS__", CSS)
+                                         .replace("__DMAX__", f"{DECOMP_LUT_MAX:g}"),
+                              "text/html; charset=utf-8")
+        if u.path == "/api/decompose":
+            with LOCK:
+                model, shape = MODEL["model"], MODEL["shape"]
+            if model is None:
+                return self._send(json.dumps({"error": "run a fit first"}),
+                                  "application/json")
+            try:
+                # A COPY: level_gain lives on the model the trainer may still be
+                # stepping, and a decomposition that zeroed levels underneath a
+                # running fit would corrupt it.
+                import copy
+                snap = copy.deepcopy(model)
+                out = decompose(snap, shape, self.device, q.get("mode", "alone"))
+                print(f"[decompose] {len(out['panels'])} levels, mode "
+                      f"{out['mode']}, rendered at {out['render']}", flush=True)
+                return self._send(json.dumps(out), "application/json")
+            except Exception as e:
+                print(f"[decompose] failed: {type(e).__name__}: {e}", flush=True)
+                return self._send(json.dumps({"error": f"{type(e).__name__}: {e}"}),
+                                  "application/json")
         if u.path == "/api/preview":
             p = _params(q)
             try:
