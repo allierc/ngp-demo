@@ -223,7 +223,15 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
 
     mode="alone"  the MLP fed by that level and nothing else
         "upto"    levels 0..l, the fit as it stands at that resolution
-        "adds"    upto(l) - upto(l-1), what releasing the level changed, signed
+        "adds"    upto(l) - upto(l-1), what releasing the level changed, signed.
+                  The first tile is the BASELINE those differences start from,
+                  because without it the montage is not a decomposition of
+                  anything: the decoder fed an all-zero feature vector does not
+                  return black, it returns a mid grey (measured 0.2387 on this
+                  painting's background), so the early levels spend themselves
+                  bringing the background DOWN and every one of them is negative
+                  with nothing positive to compensate.  base + the 15 deltas is
+                  the fit, exactly.
     """
     h, w, c = shape
     sub = max(1, int(round(max(h, w) / side)))
@@ -231,7 +239,9 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
     coords = pixel_centers(hs, ws, device)
     enc = model.encoding
     keep = enc.level_gain.clone()
-    levels = list(range(enc.n_levels))[-n_panels:]
+    # "adds" spends one of its tiles on the baseline, so it differences one
+    # level fewer.
+    levels = list(range(enc.n_levels))[-(n_panels - 1 if mode == "adds" else n_panels):]
     cache, panels = {}, []
 
     def upto(k):
@@ -244,6 +254,13 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
         return cache[k]
 
     try:
+        if mode == "adds" and levels[0] > 0:
+            b = upto(levels[0] - 1)
+            panels.append({"level": levels[0] - 1, "label": f"0..{levels[0]-1}",
+                           "cells": int(enc.resolutions[levels[0] - 1][0]),
+                           "px_per_cell": round(w / enc.resolutions[levels[0] - 1][0], 2),
+                           "dense": bool(enc.dense[levels[0] - 1]),
+                           "amp": float(b.mean()), "kind": "base", "rgb": _u8(b)})
         for l in levels:
             if mode == "upto":
                 img = upto(l)
@@ -261,9 +278,11 @@ def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
                 enc.level_gain.copy_(g)
                 img = render(model, coords, (hs, ws, c)).clamp(0, 1)
                 rgb, amp = _u8(img), float(img.std())
-            panels.append({"level": l, "cells": int(enc.resolutions[l][0]),
+            panels.append({"level": l, "label": f"L{l}",
+                           "cells": int(enc.resolutions[l][0]),
                            "px_per_cell": round(w / enc.resolutions[l][0], 2),
-                           "dense": bool(enc.dense[l]), "amp": amp, "rgb": rgb})
+                           "dense": bool(enc.dense[l]), "amp": amp,
+                           "kind": mode, "rgb": rgb})
     finally:
         enc.level_gain.copy_(keep)
     return {"panels": panels, "mode": mode, "n_levels": enc.n_levels,
@@ -289,7 +308,7 @@ def montage_png(out, cols=4, gap=2, label=True):
         d = ImageDraw.Draw(im)
         for i, p in enumerate(out["panels"]):
             y, x = (i // cols) * (th + gap), (i % cols) * (tw + gap)
-            d.text((x + 2, y + 1), f"L{p['level']}", fill=(255, 255, 255))
+            d.text((x + 2, y + 1), p["label"], fill=(255, 255, 255))
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
@@ -928,7 +947,12 @@ coarse levels draw a blur because their cells are hundreds of pixels wide; the f
 ones draw an edge map because their cells are about a pixel. <b>They do not add
 up:</b> the decoder is a nonlinear MLP, so a level alone is not a term of a sum.
 The <i>what level adds</i> view is the honest decomposition &mdash; it differences two
-renders instead of isolating one level.</p>
+renders instead of isolating one level, and its first tile is the
+<b>baseline</b> those differences start from. That baseline is not black: fed an
+all-zero feature vector this decoder returns a mid grey, so the early levels
+spend themselves pulling the dark background <i>down</i> and read blue with
+nothing red to compensate. Baseline plus the fifteen differences is the fit,
+exactly.</p>
 <div class="controls"><div class="group"><div class="label">view</div>
   <div class="seg" id="modes"></div></div>
 <div class="group"><div class="label">&nbsp;</div>
@@ -960,10 +984,12 @@ async function draw(){
       : ``);
   document.getElementById("mont").innerHTML = r.panels.map(p=>
     `<div class="cell"><img src="${p.png}">`
-   +`<div class="lab">L${p.level} &middot; ${p.cells} cells &middot; `
+   +`<div class="lab">${p.label} &middot; ${p.cells} cells &middot; `
    +`${p.px_per_cell} px/cell &middot; `
    +`<span class="${p.dense?"":"hash"}">${p.dense?"dense":"hashed"}</span>`
-   +` &middot; ${mode==="adds"?"mean |&Delta;|":"std"} ${p.amp.toFixed(4)}</div></div>`
+   +` &middot; ${p.kind==="base" ? "the baseline, mean" :
+                  (mode==="adds"?"mean |&Delta;|":"std")} `
+   +`${p.amp.toFixed(4)}</div></div>`
   ).join("");
 }
 paint(); draw();
