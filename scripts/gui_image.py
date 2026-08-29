@@ -98,8 +98,11 @@ def build(p, shape):
     h, w, c = shape
     n_lv = int(p["n_levels"])
     n_min = int(FIXED["base_resolution"])
-    max_res = ((w, h) if int(p["max_resolution"]) <= 0
-               else (int(p["max_resolution"]),) * 2)
+    # The knob is PIXELS PER FINEST CELL, which is the number the page is about;
+    # N_max follows from it and the image, one value per axis so the cells stay
+    # square on a non-square picture. 1 px per cell is the pixel grid itself.
+    px = max(1.0, float(p["px_per_finest_cell"]))
+    max_res = (max(n_min + 1, round(w / px)), max(n_min + 1, round(h / px)))
     # Equation 3 of the paper: b is DERIVED from the two ends and L, not set.
     # It was a knob, and a knob it should not be -- b, N_max and L are three
     # ways of saying two things, and the third silently loses to the cap.
@@ -365,10 +368,11 @@ def train_job(p, device):
         info = describe(model, shape)
         shuffled = model.encoding.hash_shuffle
         label = (f"L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
-                 f"{'auto' if int(p['max_resolution']) <= 0 else int(p['max_resolution'])}"
+                 f"{float(p['px_per_finest_cell']):g}px"
                  + ("" if shuffled else " raster"))
         print(f"[run] L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
-              f"Nmax {'auto' if int(p['max_resolution']) <= 0 else int(p['max_resolution'])} "
+              f"{float(p['px_per_finest_cell']):g} px per finest cell "
+              f"(Nmax {model.encoding.resolutions[-1][0]}) "
               f"b {model.encoding.per_level_scale[0]:.3f} (derived) hash {'xor primes' if shuffled else 'raster mod T'}  "
               f"{int(p['steps'])} steps, lr {float(p['lr']):.1e}, "
               f"batch {int(p['batch']):,}  -> {info['n_total']:,} params "
@@ -488,9 +492,6 @@ KNOBS = [
     # comparison is the whole meaning of the knob.
     {"name": "log2_hashmap_size", "label": "max entries per level T", "min": 10,
      "max": 24, "default": 10, "step": 1, "pow2": True},
-    {"name": "max_resolution",
-     "label": "finest cells per axis N_max (0 = the pixel count)",
-     "min": 0, "max": 4096, "default": 0, "step": 32},
 ]
 TRAIN_KNOBS = [
     {"name": "lr", "label": "learning rate", "min": 1e-4, "max": 1e-1,
@@ -501,7 +502,7 @@ TRAIN_KNOBS = [
      "max": 1048576, "default": 262144, "step": 4096},
 ]
 DEFAULTS = {k["name"]: k["default"] for k in KNOBS + TRAIN_KNOBS}
-DEFAULTS.update(FIXED, downsample=2, hash_shuffle=1)
+DEFAULTS.update(FIXED, downsample=2, hash_shuffle=1, px_per_finest_cell=1)
 
 
 PAGE = r"""<!doctype html>
@@ -619,6 +620,9 @@ function seg(name, opts, key, after){
     s.appendChild(b); });
   g.append(l,s); C.appendChild(g);
 }
+// N_max as the quantity that means something on a picture: how many pixels one
+// cell of the finest level covers. 1 is the pixel grid itself.
+seg("px per finest cell", [1,2,4,8,16,32,64], "px_per_finest_cell");
 seg("downsample", [1,2,4], "downsample");
 // The one encoder knob that is not in Table 1: whether the index is shuffled at
 // all. Off means the node's raster index modulo T, so the collisions stop being
@@ -893,7 +897,7 @@ function drawLevels(bk){
     +`<div style="line-height:0">${bar}</div><div>${ticks}</div>`
     +`<div style="margin-top:5px">the squares are 64 px analysis blocks, not `
     +`encoder cells: ${tinted} of ${bk.blocks.length} are tinted because their `
-    +`level's cells are under 3 screen px. Lower "finest cells per axis" to see `
+    +`level's cells are under 3 screen px. Raise "px per finest cell" to see `
     +`real cells. Levels contributing (blank regions have no scale; levels do `
     +`not specialise by frequency): `
     + used.map(l=>{

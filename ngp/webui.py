@@ -363,9 +363,12 @@ knob does nothing; a level with more folds its nodes through the hash and starts
 sharing entries. The line under the ladder gives the comparison directly: how many
 nodes the finest level wants against how many it may hold, and how many levels
 collide as a result.</li>
-<li><b>finest cells per axis N_max</b> &mdash; where the ladder stops. 0 means the
-image's own pixel count. Going finer than the pixel spacing buys almost no PSNR,
-costs parameters, and shows up as noise in any derivative taken through the fit.</li>
+<li><b>px per finest cell</b> &mdash; where the ladder stops, said in the unit that
+means something on a picture: how many pixels one cell of the finest level covers.
+1 is the pixel grid itself and <code>N_max</code> follows from it and the image
+size. Going below 1 buys almost no PSNR, costs parameters, and shows up as noise in
+any derivative taken through the fit; going up coarsens the fit and is how you see
+real cells in the level panel.</li>
 </ul>
 
 <h2>The one knob that is not in the paper's table</h2>
@@ -391,8 +394,8 @@ it darkens as the fit improves rather than rescaling itself.</li>
 <i>analysis blocks</i>; each is coloured by the finest level clearing 8% of that
 block's strongest contribution, and drawn with that level's cells <i>if</i> they are
 at least 3 screen pixels. At 1 px per finest cell nothing is drawable, so every
-block tints and only the colours carry information. Lower <b>finest cells per
-axis</b> to see real cells. It shows signal versus none, not local scale.</li>
+block tints and only the colours carry information. Raise <b>px per finest
+cell</b> to see real cells. It shows signal versus none, not local scale.</li>
 <li><b>the 16 finest levels</b> &mdash; the encoder taken apart while it trains. By
 default each tile is what that level <i>adds</i>, signed: blue negative, black zero,
 red positive, on a fixed &plusmn;0.1. The first tile is the baseline the differences
