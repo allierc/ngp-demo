@@ -18,6 +18,8 @@ time.
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import os
 import sys
@@ -37,7 +39,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ngp import NGPField
 from ngp.utils import BilinearImage, pixel_centers, psnr, read_image, render
-from ngp.webui import ABOUT_HTML, CSS, INTERFACE_IMAGE, cmap_png, gray_png
+from PIL import Image, ImageDraw
+
+from ngp.webui import ABOUT_HTML, CSS, INTERFACE_IMAGE, cmap_png, gray_png,\
+    png_data_uri
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_IMAGE = os.path.join(ROOT, "assets/girl_with_a_pearl_earring.jpg")
@@ -52,7 +57,7 @@ ERROR_LUT_MAX = 0.10
 
 JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
        "metrics": {}, "images": {}, "ladder": [], "note": "", "stamp": 0,
-       "history": [], "blocks": {}}
+       "history": [], "blocks": {}, "decomp_mode": "adds"}
 LOCK = threading.Lock()
 STOP = threading.Event()
 IMAGES = {}                          # downsample factor -> (tensor, target, coords)
@@ -197,13 +202,17 @@ def level_maps(model, shape, device, block_px=64, sub=3, thresh=0.08):
 # after the run ends.  It is deep-copied before its level gains are touched: the
 # gains live on the model the trainer is still stepping.
 MODEL = {"model": None, "shape": None}
+# Which view the LIVE panel draws.  One mode, not all three: the montage travels
+# in the state payload on every poll, and three of them would be three times the
+# bytes for two views nobody is looking at.
+DECOMP = {"mode": "adds", "side": 110}
 # |what level l adds| on a fixed scale, so a panel darkens as the level's
 # contribution shrinks instead of rescaling to its own maximum.
 DECOMP_LUT_MAX = 0.10
 
 
 @torch.no_grad()
-def decompose(model, shape, device, mode="alone", n_panels=16, side=420):
+def decompose(model, shape, device, mode="adds", n_panels=16, side=420):
     """Render the finest `n_panels` levels one at a time.
 
     The encoder already carries a per-level gain (`level_gain`, used by the
@@ -238,23 +247,53 @@ def decompose(model, shape, device, mode="alone", n_panels=16, side=420):
         for l in levels:
             if mode == "upto":
                 img = upto(l)
-                png, amp = gray_png(img), float(img.std())
+                rgb, amp = _u8(img), float(img.std())
             elif mode == "adds":
                 d = (upto(l) - upto(l - 1)).abs().mean(-1)
-                png, amp = cmap_png(d.cpu().numpy(), DECOMP_LUT_MAX), float(d.mean())
+                rgb, amp = _heat(d, DECOMP_LUT_MAX), float(d.mean())
             else:
                 g = torch.zeros_like(enc.level_gain)
                 g[l] = 1.0
                 enc.level_gain.copy_(g)
                 img = render(model, coords, (hs, ws, c)).clamp(0, 1)
-                png, amp = gray_png(img), float(img.std())
+                rgb, amp = _u8(img), float(img.std())
             panels.append({"level": l, "cells": int(enc.resolutions[l][0]),
                            "px_per_cell": round(w / enc.resolutions[l][0], 2),
-                           "dense": bool(enc.dense[l]), "amp": amp, "png": png})
+                           "dense": bool(enc.dense[l]), "amp": amp, "rgb": rgb})
     finally:
         enc.level_gain.copy_(keep)
     return {"panels": panels, "mode": mode, "n_levels": enc.n_levels,
             "render": f"{ws}x{hs}"}
+
+
+def _u8(t):
+    return (np.clip(t.detach().cpu().numpy(), 0, 1) * 255).astype(np.uint8)
+
+
+def _heat(t, vmax):
+    x = np.clip(t.detach().cpu().numpy() / max(vmax, 1e-6), 0, 1)
+    return (matplotlib.colormaps["inferno"](x)[..., :3] * 255).astype(np.uint8)
+
+
+def montage_png(out, cols=4, gap=2, label=True):
+    """The decomposition as ONE picture, so the live panel is an image like any
+    other and not a second layout to keep in step with the first."""
+    tiles = [p["rgb"] for p in out["panels"]]
+    th, tw, _ = tiles[0].shape
+    rows = (len(tiles) + cols - 1) // cols
+    sheet = np.zeros((rows * (th + gap) - gap, cols * (tw + gap) - gap, 3), np.uint8)
+    for i, t in enumerate(tiles):
+        y, x = (i // cols) * (th + gap), (i % cols) * (tw + gap)
+        sheet[y:y + th, x:x + tw] = t
+    im = Image.fromarray(sheet)
+    if label:
+        d = ImageDraw.Draw(im)
+        for i, p in enumerate(out["panels"]):
+            y, x = (i // cols) * (th + gap), (i % cols) * (tw + gap)
+            d.text((x + 2, y + 1), f"L{p['level']}", fill=(255, 255, 255))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def train_job(p, device):
@@ -331,8 +370,16 @@ def train_job(p, device):
                     JOB["images"]["error"] = cmap_png(err, ERROR_LUT_MAX)
                     JOB["stamp"] += 1
                 eff, blocks = level_maps(model, shape, device)
+                # The same decomposition the decompose window draws, at a tile
+                # size that costs one small render per level rather than one
+                # full one -- 16 renders of ~100 px against a fit step, which is
+                # what makes it affordable every refresh.
+                dec = decompose(model, shape, device, mode=DECOMP["mode"],
+                                side=DECOMP["side"])
                 with LOCK:
                     JOB["images"]["levels"] = cmap_png(eff, LEVEL_LUT_MAX, "levels")
+                    JOB["images"]["montage"] = montage_png(dec)
+                    JOB["decomp_mode"] = dec["mode"]
                     JOB["blocks"] = {"blocks": blocks, "w": w, "h": h,
                                      "n_levels": len(ladder)}
                     JOB["stamp"] += 1
@@ -441,6 +488,9 @@ on quality against time and against parameter count.</p>
     <div class="cap">psnr against training time &mdash; this run and the last few</div></div>
   <div class="panel"><canvas id="c_effmap" width="330" height="460"></canvas>
     <div class="cap">effective level per pixel &mdash; same 0&ndash;20 scale</div></div>
+  <div class="panel"><canvas id="c_montage" width="330" height="460"></canvas>
+    <div class="cap" id="cap_mont">the 16 finest levels, one at a time</div>
+    <div class="seg" id="decmodes" style="margin-top:6px"></div></div>
 </div>
 <div class="row" style="margin-top:20px">
   <div class="panel"><div class="label">resolution ladder</div>
@@ -611,6 +661,27 @@ async function startRun(){
 document.getElementById("run").onclick=startRun;
 document.getElementById("stop").onclick=()=>fetch("/api/stop");
 document.getElementById("clear").onclick=async()=>{ await fetch("/api/clear"); poll(); };
+// The live montage: one server-side mode, switched here, redrawn on the next
+// refresh of the fit.
+const DECMODES=[["adds","what it adds"],["alone","the level alone"],
+                ["upto","levels 0..l"]];
+let decmode="adds";
+(function(){
+  const g=document.getElementById("decmodes");
+  DECMODES.forEach(([k,lab])=>{ const b=document.createElement("button");
+    b.textContent=lab; b.dataset.k=k;
+    b.onclick=async()=>{ decmode=k; paintDec();
+      await fetch("/api/decomp_mode?mode="+k); };
+    g.appendChild(b); });
+  paintDec();
+})();
+function paintDec(){
+  const g=document.getElementById("decmodes");
+  [...g.children].forEach(b=>b.setAttribute("aria-pressed", b.dataset.k===decmode));
+  const lab=(DECMODES.find(m=>m[0]===decmode)||["",""])[1];
+  document.getElementById("cap_mont").textContent=
+    `the 16 finest levels \u2014 ${lab}`;
+}
 document.getElementById("decompose").onclick=()=>
   window.open("/decompose", "ngp_decompose", "width=1500,height=1000");
 
@@ -814,6 +885,7 @@ async function poll(){
     LAST=r.stamp;
     drawImg("c_ref", r.images.reference); drawImg("c_fit", r.images.fit);
     drawImg("c_err", r.images.error);   drawImg("c_effmap", r.images.levels);
+    drawImg("c_montage", r.images.montage);
     drawLevels(r.blocks);
     drawCurve(r.curve, r.history); drawLadder(r.ladder, r.metrics);
     drawHistory(r.history);
@@ -866,9 +938,9 @@ renders instead of isolating one level.</p>
 <div class="note" id="note">rendering&hellip;</div>
 <div class="mont" id="mont"></div>
 </div><script>
-const MODES=[["alone","the level alone"],["adds","what the level adds"],
+const MODES=[["adds","what the level adds"],["alone","the level alone"],
              ["upto","levels 0..l"]];
-let mode="alone";
+let mode="adds";
 const seg=document.getElementById("modes");
 MODES.forEach(([k,lab])=>{ const b=document.createElement("button");
   b.textContent=lab; b.onclick=()=>{ mode=k; draw(); paint(); }; b.dataset.k=k;
@@ -933,6 +1005,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(DECOMP_PAGE.replace("__CSS__", CSS)
                                          .replace("__DMAX__", f"{DECOMP_LUT_MAX:g}"),
                               "text/html; charset=utf-8")
+        if u.path == "/api/decomp_mode":
+            m = q.get("mode", "adds")
+            if m in ("alone", "adds", "upto"):
+                DECOMP["mode"] = m
+            return self._send(json.dumps({"mode": DECOMP["mode"]}),
+                              "application/json")
         if u.path == "/api/decompose":
             with LOCK:
                 model, shape = MODEL["model"], MODEL["shape"]
@@ -945,7 +1023,9 @@ class Handler(BaseHTTPRequestHandler):
                 # running fit would corrupt it.
                 import copy
                 snap = copy.deepcopy(model)
-                out = decompose(snap, shape, self.device, q.get("mode", "alone"))
+                out = decompose(snap, shape, self.device, q.get("mode", "adds"))
+                for p in out["panels"]:
+                    p["png"] = png_data_uri(p.pop("rgb"))
                 print(f"[decompose] {len(out['panels'])} levels, mode "
                       f"{out['mode']}, rendered at {out['render']}", flush=True)
                 return self._send(json.dumps(out), "application/json")

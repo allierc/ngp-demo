@@ -32,10 +32,11 @@ python scripts/gui_time.py      # http://localhost:8024  -- a warp that moves
 setting *builds* before you spend a minute training it: the resolution ladder
 level by level, which levels have to hash, the parameter count against the
 image's own value count. Finished runs stay on the curve, so settings compare
-directly on quality against time and parameters. Its **decompose** button opens a
-second window with a 4x4 montage of the 16 finest levels, each rendered with that
-level left on and every other level's features zeroed -- one table per level, so
-one picture per level.
+directly on quality against time and parameters. A panel beside the effective-level
+map shows the encoder decomposed **while it trains**: a 4x4 montage of the 16 finest
+levels, by default `|levels 0..l| - |levels 0..l-1|`, so you watch the coarse levels
+lay down blobs and the fine ones sharpen edges. The **decompose** button opens the
+same thing full size, with a view that puts one level through the decoder alone.
 
 `gui.py` warps the painting by a known analytic field and asks a hash grid or a
 control grid to recover it, scoring the *field* rather than the pixels. It
