@@ -26,6 +26,7 @@ what any setting does, because the panels update while the fit runs.
 python scripts/gui_image.py     # http://localhost:8022  -- fit the painting
 python scripts/gui_field.py           # http://localhost:8021  -- recover a known warp
 python scripts/gui_time.py      # http://localhost:8024  -- a warp that moves
+python scripts/gui_scalar_time.py  # http://localhost:8025  -- a scalar field from a zarr
 ```
 
 `gui_image.py` puts every knob of the encoding on a slider and shows what that
@@ -47,7 +48,17 @@ encoder against a slip band that translates or rotates across the run. Every
 panel is triplicated at the first, middle and last frame, so a fit that only
 works at one end of the run cannot hide.
 
-All three carry a **what is an ngp?** button explaining the method and a **what
+`gui_scalar_time.py` fits `f(x, y, t)` straight from a zarr -- written for the
+toy2d store in `Plexus/prototype/graphcast`, a coarse slow wave plus a fast
+Kuramoto on four discs, which wants opposite settings from one encoder. Measured
+on it: the coarse part has **0%** of its energy above 32 cycles and a lag-1
+autocorrelation of **0.998**; the fine part has **73.6%** above 32 cycles, 15 px
+per cycle inside a disc on 15.4% of the pixels, and a lag-1 autocorrelation of
+**0.829** -- past 0.5 after one frame. So it takes 4 px per finest cell and a
+time axis **at** the frame spacing, the opposite end of stage 2. The field
+selector fits either component alone. Viridis, on a fixed symmetric scale.
+
+All the pages carry a **what is an ngp?** button explaining the method and a **what
 is this interface?** button explaining every control on that page. Each prints
 `[run]`, `[params]`, `[images]` and `[done]` to the terminal, so an empty page
 can be told apart from a fit that never started, and the parameter count is on
