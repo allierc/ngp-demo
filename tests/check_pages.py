@@ -29,6 +29,9 @@ PAGES = [
     ("scripts/gui_field.py", 8931, [("/", True, True)]),
     ("scripts/gui_image.py", 8932, [("/", True, True), ("/decompose", False, False)]),
     ("scripts/gui_time.py", 8933, [("/", True, True)]),
+    # opens idle -- it loads ~200 frames from a zarr, which is not something to
+    # start on page load
+    ("scripts/gui_scalar_time.py", 8934, [("/", False, True)]),
 ]
 
 # A realistic /api/state payload. The empty state exercises none of the drawing
