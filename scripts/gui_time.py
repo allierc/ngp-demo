@@ -117,11 +117,15 @@ def train_job(cfg, p, device):
                 f"band width {gt.width:.0f} px; "
                 f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells in space, "
                 f"{enc.resolutions[-1][2]} in time")
+        # what the fit stands against: a displacement per pixel per frame
+        n_values = n_frames * shape[0] * shape[1] * 2
+        compression = n_values / max(1, n_enc + n_mlp)
         picks = [0, n_frames // 2, n_frames - 1]
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
                        curve=[], per_frame=[], note=note, frames=picks,
                        metrics={"n_parameters": n_enc + n_mlp,
+                                "n_values": n_values, "compression": compression,
                                 "n_table": n_enc, "n_decoder": n_mlp,
                                 "n_levels_total": enc.n_levels,
                                 "total_motion": gt.total(), "unit": unit},
@@ -133,6 +137,8 @@ def train_job(cfg, p, device):
         print(f"[params] {n_enc + n_mlp:,} total = {n_enc:,} in the hash table "
               f"({enc.table.shape[0]:,} entries x {enc.table.shape[1]} features) "
               f"+ {n_mlp:,} in the decoder", flush=True)
+        print(f"[size  ] {n_enc + n_mlp:,} parameters against {n_values:,} stored "
+              f"displacements = {compression:.1f}x compression", flush=True)
 
         opt = torch.optim.Adam(model.parameters(), lr=float(p["lr"]))
         steps = int(p["steps"])
