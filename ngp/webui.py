@@ -468,10 +468,12 @@ worse, since it only delays access to the fine levels.</li>
 
 <h2>The model, and what keeps the field sane</h2>
 <ul>
-<li><b>levels</b> and <b>finest cells per axis</b> &mdash; the ladder. The cap is the
-one that matters: set it at the finest structure the <i>deformation</i> contains, not
-at the image resolution. 128 cells here is 7 px per cell against a 12-23 px finest
-feature; uncapped at 512 the fit is no better, uses 34x the parameters, and the field
+<li><b>levels L</b>, <b>max entries per level T</b> and <b>px per finest cell</b>
+&mdash; the same three knobs the fitting page uses, and b is derived from them by
+equation 3 rather than set. The last one is what matters here: set it at the finest
+structure the <i>deformation</i> contains, not at the image resolution. 8 px per cell
+is already under a 12-23 px finest feature; at 1 px per cell the fit is no better,
+uses 34x the parameters, and the field
 is 64x rougher.</li>
 <li><b>interpolation</b> &mdash; smoothstep, because the folding penalty
 differentiates the Jacobian and a linear interpolant's second derivative is

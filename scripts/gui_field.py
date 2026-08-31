@@ -22,6 +22,7 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import sys
 import threading
@@ -249,11 +250,22 @@ def train_job(cfg, p, device):
         spec = {m["name"]: m for m in resolve_inherits(cfg["models"])}[p["model"]]
         spec = json.loads(json.dumps(spec))                     # deep copy
         if spec["kind"] == "hash_grid":
+            # Settled exactly as gui_image.py settles it: L, T and pixels per
+            # finest cell are the knobs, N_max follows from the last one and the
+            # image, and b is DERIVED by equation 3 of the paper rather than set
+            # -- b, N_max and L are three ways of saying two things.
+            n_lv = int(p["n_levels"])
+            n_min = int(spec["encoding"].get("base_resolution", 8))
+            ppc = max(1.0, float(p["px_per_finest_cell"]))
+            n_max = max(n_min + 1, round(w / ppc))
             spec["encoding"].update(
-                n_levels=int(p["n_levels"]),
+                n_levels=n_lv,
                 log2_hashmap_size=int(p["log2_hashmap_size"]),
-                max_resolution=int(p["max_resolution"]),
-                interpolation=p["interpolation"])
+                base_resolution=n_min,
+                per_level_scale=math.exp((math.log(n_max) - math.log(n_min))
+                                         / max(1, n_lv - 1)),
+                max_resolution=n_max,
+                interpolation=FIXED_INTERPOLATION)
             spec.setdefault("coarse_to_fine", {})
             spec["coarse_to_fine"] = {"enabled": bool(p["coarse_to_fine"]),
                                       "start_levels": 4,
@@ -556,15 +568,16 @@ function knobPanel(el, title, list){
   const t=document.createElement("div"); t.className="title"; t.textContent=title;
   el.appendChild(t);
   list.forEach(p=>{
-    if(p.name==="interpolation"){
+    if(p.choices){
+      if(knob[p.name]===undefined) knob[p.name]=p.default;
       const d=document.createElement("div"); d.className="knob";
       const lab=document.createElement("div"); lab.className="kl";
-      lab.innerHTML="<span>interpolation</span>";
+      lab.innerHTML=`<span>${p.label}</span>`;
       const s=document.createElement("div"); s.className="seg";
-      ["linear","smoothstep"].forEach(o=>{
-        const b=document.createElement("button"); b.textContent=o;
-        b.setAttribute("aria-pressed", knob.interpolation===o);
-        b.onclick=()=>{ knob.interpolation=o;
+      p.choices.forEach(o=>{
+        const b=document.createElement("button"); b.textContent=String(o);
+        b.setAttribute("aria-pressed", knob[p.name]===o);
+        b.onclick=()=>{ knob[p.name]=o;
           [...s.children].forEach(c=>c.setAttribute("aria-pressed",c===b)); };
         s.appendChild(b); });
       d.append(lab,s); el.appendChild(d); return;
@@ -586,8 +599,9 @@ function knobPanel(el, title, list){
     const d=document.createElement("div"); d.className="knob";
     const lab=document.createElement("div"); lab.className="kl";
     const val=document.createElement("b");
-    const fmt=v=>p.log ? (+v).toExponential(1)
-                       : (p.step<1 ? (+v).toFixed(3) : String(Math.round(v)));
+    const fmt=v=>p.pow2 ? `2^${Math.round(v)} = ${Math.pow(2,Math.round(v)).toLocaleString()}`
+                        : (p.log ? (+v).toExponential(1)
+                                 : (p.step<1 ? (+v).toFixed(3) : String(Math.round(v))));
     const rawOf=v=>p.log ? Math.log10(v) : v;
     const valOf=r=>p.log ? Math.pow(10, r) : +r;
     val.textContent=fmt(knob[p.name]);
@@ -917,20 +931,26 @@ def _isnum(v):
         return False
 
 
+# Not a knob on any page: smoothstep is what the registration loss needs, since
+# a C^0 encoding has an identically zero second derivative and the bending
+# energy computed through it is meaningless.
+FIXED_INTERPOLATION = "smoothstep"
+
 KNOB_SPEC = {
     "hash": [
-        {"name": "n_levels", "label": "levels", "min": 2, "max": 16,
+        {"name": "n_levels", "label": "levels L", "min": 2, "max": 16,
          "default": 8, "step": 1},
-        # Capped at the DEFORMATION's scale, not the image's. The finest thing
-        # in these warps is ~23 px (multiscale) or a 12 px shear band, and 128
-        # cells is 7 px per cell. Uncapped at 512 the fit is no better and the
-        # field is far rougher: 34x the parameters, 64x the bending energy, and
-        # a slightly worse endpoint error. The levels below the data's own scale
-        # do not go unused -- they get used indiscriminately, because nothing
-        # tells a fine level to stay out of smooth content.
-        {"name": "max_resolution", "label": "finest cells per axis",
-         "min": 16, "max": 128, "default": 128, "step": 16},
-        {"name": "interpolation"},
+        {"name": "log2_hashmap_size", "label": "max entries per level T",
+         "min": 10, "max": 24, "default": 16, "step": 1, "pow2": True},
+        # Set against the DEFORMATION's scale, not the image's. The finest thing
+        # in these warps is ~23 px (multiscale) or a 12 px shear band, so 8 px
+        # per cell is already under it. At 1 px per cell the fit is no better
+        # and the field is far rougher: 34x the parameters, 64x the bending
+        # energy, and a slightly worse endpoint error. The levels below the
+        # data's own scale do not go unused -- they get used indiscriminately,
+        # because nothing tells a fine level to stay out of smooth content.
+        {"name": "px_per_finest_cell", "label": "px per finest cell",
+         "choices": [1, 2, 4, 8, 16, 32, 64], "default": 8},
         {"name": "coarse_to_fine"},
     ],
     "control": [
@@ -956,12 +976,7 @@ KNOB_SPEC = {
 }
 KNOB_DEFAULTS = {k["name"]: k.get("default") for g in KNOB_SPEC.values() for k in g
                  if "default" in k}
-# Not a slider: with the finest level at 128 cells in 2D, every level fits
-# densely in any table above 2^15 and the size is an upper bound that never
-# binds. It stays in the config, and in 3D -- 128^3 is 2M nodes -- it becomes the
-# knob that decides everything.
-KNOB_DEFAULTS.update(interpolation="smoothstep", coarse_to_fine=1, pyramid=1,
-                     log2_hashmap_size=16)
+KNOB_DEFAULTS.update(coarse_to_fine=1, pyramid=1)
 
 
 def main():

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -85,14 +86,25 @@ def train_job(cfg, p, device):
                         offset_px=float(p["band_offset"]), device=device)
 
         torch.manual_seed(0)
+        # Settled as gui_image.py settles it: L, T and pixels per finest cell,
+        # with N_max following from the last one and b DERIVED per axis by
+        # equation 3.  The time axis is the one thing that is not shared -- it is
+        # capped in CELLS, at the frame spacing, because that cap is stage 2's
+        # whole result and pixels mean nothing along t.
+        n_lv = int(p["n_levels"])
+        n_min = (8, 8, 2)
+        ppc = max(1.0, float(p["px_per_finest_cell"]))
+        n_max = (max(9, round(w / ppc)), max(9, round(h / ppc)),
+                 int(p["time_cells"]))
+        scale = tuple(math.exp((math.log(mx) - math.log(mn)) / max(1, n_lv - 1))
+                      for mn, mx in zip(n_min, n_max))
         model = NGPField(
             n_input_dims=3, n_output_dims=2, n_neurons=64, n_hidden_layers=2,
             activation="gelu", output_activation="none",
-            n_levels=int(p["n_levels"]), n_features_per_level=2,
+            n_levels=n_lv, n_features_per_level=2,
             log2_hashmap_size=int(p["log2_hashmap_size"]),
-            base_resolution=(8, 8, 2), per_level_scale=1.5,
-            max_resolution=(int(p["max_resolution"]), int(p["max_resolution"]),
-                            int(p["time_cells"])),
+            base_resolution=n_min, per_level_scale=scale,
+            max_resolution=n_max,
             interpolation=("smoothstep", "smoothstep", "linear"),
         ).to(device)
         # smoothstep in space and linear in time: on an axis whose cells line up
@@ -432,10 +444,27 @@ function panel(title, list){
   const t=document.createElement("div"); t.className="title"; t.textContent=title;
   K.appendChild(t);
   list.forEach(p=>{
+    if(p.choices){
+      if(knob[p.name]===undefined) knob[p.name]=p.default;
+      const d=document.createElement("div"); d.className="knob";
+      const lab=document.createElement("div"); lab.className="kl";
+      lab.innerHTML=`<span>${p.label}</span>`;
+      const s=document.createElement("div"); s.className="seg";
+      p.choices.forEach(o=>{
+        const b=document.createElement("button"); b.textContent=String(o);
+        b.setAttribute("aria-pressed", knob[p.name]===o);
+        b.onclick=()=>{ knob[p.name]=o;
+          [...s.children].forEach(c=>c.setAttribute("aria-pressed",c===b));
+          PARAMS=""; setup(); };
+        s.appendChild(b); });
+      d.append(lab,s); K.appendChild(d); return;
+    }
     const d=document.createElement("div"); d.className="knob";
     const lab=document.createElement("div"); lab.className="kl";
     const val=document.createElement("b");
-    const fmt=v=>p.log?(+v).toExponential(1):(p.step<1?(+v).toFixed(3):String(Math.round(v)));
+    const fmt=v=>p.pow2?`2^${Math.round(v)} = ${Math.pow(2,Math.round(v)).toLocaleString()}`
+                       :(p.log?(+v).toExponential(1)
+                              :(p.step<1?(+v).toFixed(3):String(Math.round(v))));
     const raw=v=>p.log?Math.log10(v):v, un=r=>p.log?Math.pow(10,r):+r;
     val.textContent=fmt(knob[p.name]);
     const nm=document.createElement("span"); nm.textContent=p.label;
@@ -651,14 +680,18 @@ KNOB_SPEC = {
          "max": 60, "default": 18, "step": 1},
         {"name": "band_width", "label": "band width (px)", "min": 2, "max": 120,
          "default": 12, "step": 1},
-        {"name": "n_levels", "label": "levels", "min": 2, "max": 16, "default": 8,
-         "step": 1},
-        {"name": "max_resolution", "label": "finest cells per axis, space",
-         "min": 16, "max": 256, "default": 128, "step": 16},
+        {"name": "n_levels", "label": "levels L", "min": 2, "max": 16,
+         "default": 8, "step": 1},
+        {"name": "log2_hashmap_size", "label": "max entries per level T",
+         "min": 10, "max": 24, "default": 19, "step": 1, "pow2": True},
+        {"name": "px_per_finest_cell", "label": "px per finest cell",
+         "choices": [1, 2, 4, 8, 16, 32, 64], "default": 8},
+        # The one axis that is not settled in pixels. Capping t at the frame
+        # spacing is stage 2's result: uncapped, the finest levels resolve each
+        # observed frame separately and the fit stops interpolating between
+        # them, 47.4 dB on held-out midpoints against 23.2.
         {"name": "time_cells", "label": "cells along t", "min": 2, "max": 128,
          "default": 16, "step": 1},
-        {"name": "log2_hashmap_size", "label": "log2 entries per level", "min": 12,
-         "max": 22, "default": 19, "step": 1},
     ],
     "train": [
         {"name": "lr", "label": "learning rate", "min": 1e-4, "max": 1e-1,
