@@ -41,6 +41,9 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from ngp import NGPField                                              # noqa: E402
 from ngp.utils import psnr                                            # noqa: E402
+# The fast path lives in the package, so a page and this entry point run the
+# same code rather than two copies that drift.
+from ngp.hashgrid_warp import HalfMLP, SplitOpt                       # noqa: E402
 # The dataset loading and the encoder construction live with the page that was
 # written against them; importing keeps one implementation rather than a second
 # that drifts.
@@ -162,70 +165,11 @@ def build_from_config(cfg, shape, n_frames, device):
         raise SystemExit(f"unknown encoder.decoder.implementation {dimpl!r}")
     dprec = str(dec.get("precision", "bf16"))
     if dprec in ("bf16", "fp16"):
-        model.mlp = _HalfMLP(model.mlp, torch.bfloat16 if dprec == "bf16"
-                             else torch.float16)
+        model.mlp = HalfMLP(model.mlp, torch.bfloat16 if dprec == "bf16"
+                            else torch.float16)
     elif dprec != "fp32":
         raise SystemExit(f"unknown encoder.decoder.precision {dprec!r}")
     return model, p
-
-
-class _HalfMLP(torch.nn.Module):
-    """Run the MLP in half and hand fp32 back to the loss.
-
-    A Module rather than a closure because the optimiser splits the parameters
-    by asking `model.mlp.parameters()`, and a plain function has none.  The
-    weights stay fp32 masters -- only the matmuls are cast -- so Adam's
-    arithmetic is unchanged and the gradient reaching the encoder arrives in the
-    precision its kernel expects.
-    """
-
-    def __init__(self, inner, dt):
-        super().__init__()
-        self.inner, self.dt = inner, dt
-
-    def forward(self, f):
-        with torch.autocast("cuda", dtype=self.dt):
-            return self.inner(f).float()
-
-
-def _wrap_half_encoder(enc):
-    """Feed the encoder half-precision coordinates and hand fp32 back out.
-
-    The table is half, so the gather and the interpolation happen in half and
-    move half the bytes; the concatenated features are cast back at the boundary
-    so the decoder, the loss and Adam's arithmetic are untouched.  Only the part
-    that was traffic-bound changes precision.
-    """
-    inner, dt = enc.forward, enc.table.dtype
-
-    def forward(x):
-        return inner(x.to(dt)).float()
-
-    enc.forward = forward
-
-
-class SplitOpt:
-    """Torch's Adam for the decoder, a fused kernel for the table.
-
-    Two parameter groups with nothing in common: 6,337 decoder weights that
-    every step needs, and 32.5 M table values of which 45.3% get a gradient.
-    One optimiser over both has to treat them the same.
-    """
-
-    def __init__(self, model, lr, skip_zero=True):
-        from ngp.hashgrid_warp import TableAdam
-        table = model.encoding.table
-        rest = [q for q in model.parameters() if q is not table]
-        self.small = torch.optim.Adam(rest, lr=lr)
-        self.big = TableAdam(table, lr=lr, skip_zero=skip_zero)
-
-    def zero_grad(self, set_to_none=True):
-        self.small.zero_grad(set_to_none=set_to_none)
-        self.big.zero_grad(set_to_none=set_to_none)
-
-    def step(self):
-        self.small.step()
-        self.big.step()
 
 
 def make_opt(cfg, model, lr):
