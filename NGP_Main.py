@@ -599,7 +599,10 @@ def main():
         run_table(cfg.get("name", name), log_dir)
     elif task == "fit":
         out = run_fit(cfg, cfg.get("name", name), device)
-        f = os.path.join(log_dir, f"fit_{out['gpu']}.json")
+        stem = os.path.splitext(os.path.basename(path))[0]
+        tail = ("" if stem == cfg.get("name", name)
+                else "_" + stem.replace(cfg.get("name", name), "").lstrip("_"))
+        f = os.path.join(log_dir, f"fit_{out['gpu']}{tail}.json")
         json.dump(out, open(f, "w"), indent=1)
         print(f"wrote {f}")
     elif task == "profile":
