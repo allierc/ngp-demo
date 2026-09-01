@@ -1,0 +1,37 @@
+name: zapbench_bench
+
+dataset:
+  field: zapbench consecutive
+  downsample: 1
+  glob:
+    - /workspace/Plexus/prototype/graphcast/log/*/field.zarr
+    - data/*/field.zarr
+
+encoder:
+  n_levels: 16
+  log2_hashmap_size: 22
+  n_features_per_level: 2
+  base_resolution: [8, 8, 2]
+  px_per_finest_cell: 2
+  frames_per_finest_cell: 2
+  interpolation: [smoothstep, smoothstep, linear]
+  implementation: default
+  precision: bf16
+  decoder:
+    n_neurons: 64
+    n_hidden_layers: 2
+    activation: gelu
+
+training:
+  lr: 1.0e-2
+  steps: 1500
+  batch: 262144
+  seed: 0
+
+benchmark:
+  warmup_steps: 50
+  timed_steps: 300
+  repeats: 3
+  eval_every: 0
+  amp: false
+  card_gb: 288

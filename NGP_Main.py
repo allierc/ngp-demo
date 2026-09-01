@@ -79,6 +79,20 @@ def build_from_config(cfg, shape, n_frames, device):
     # encoder; "compile" is the same graph handed to inductor; "warp" will be
     # the hand-written kernel. Swapping one for another asserts the maths did
     # not change, which tests/impl_gate.py checks.
+    # PRECISION, and specifically of the TABLE. instant-NGP stores its table in
+    # half; the gather that dominates this step is traffic-bound, so halving the
+    # bytes it moves is the one change that attacks the same 88% a kernel would.
+    # Distinct from autocast, which casts every intermediate and adds traffic --
+    # the MPM note measured that going the wrong way.
+    prec = str(enc.get("precision", "fp32"))
+    if prec in ("bf16", "fp16"):
+        dt = torch.bfloat16 if prec == "bf16" else torch.float16
+        with torch.no_grad():
+            model.encoding.table.data = model.encoding.table.data.to(dt)
+        _wrap_half_encoder(model.encoding)
+    elif prec != "fp32":
+        raise SystemExit(f"unknown encoder.precision {prec!r}")
+
     impl = str(enc.get("implementation", "default"))
     if impl == "compile":
         model.encoding.forward = torch.compile(model.encoding.forward,
@@ -86,6 +100,22 @@ def build_from_config(cfg, shape, n_frames, device):
     elif impl != "default":
         raise SystemExit(f"unknown encoder.implementation {impl!r}")
     return model, p
+
+
+def _wrap_half_encoder(enc):
+    """Feed the encoder half-precision coordinates and hand fp32 back out.
+
+    The table is half, so the gather and the interpolation happen in half and
+    move half the bytes; the concatenated features are cast back at the boundary
+    so the decoder, the loss and Adam's arithmetic are untouched.  Only the part
+    that was traffic-bound changes precision.
+    """
+    inner, dt = enc.forward, enc.table.dtype
+
+    def forward(x):
+        return inner(x.to(dt)).float()
+
+    enc.forward = forward
 
 
 def get_data(cfg, device):
@@ -187,6 +217,7 @@ def run_bench(cfg, name, device):
     out = {
         "config": name, "gpu": gpu_tag(device),
         "impl": str(cfg["encoder"].get("implementation", "default")),
+        "precision": str(cfg["encoder"].get("precision", "fp32")),
         "device_name": (torch.cuda.get_device_name(device)
                         if device.type == "cuda" else platform.processor() or "cpu"),
         "torch": torch.__version__, "cuda": torch.version.cuda,
@@ -379,12 +410,12 @@ def run_table(name, log_dir):
           f"{rows[0]['width']}x{rows[0]['height']}, "
           f"{rows[0]['n_parameters']:,} parameters, batch {rows[0]['batch']:,}\n")
     steps = rows[0].get("train_steps", 0)
-    print(f"  {'gpu':22s} {'impl':>8s} {'ms/step':>9s} {'M smp/s':>9s} "
+    print(f"  {'gpu':22s} {'impl':>8s} {'prec':>6s} {'ms/step':>9s} {'M smp/s':>9s} "
           f"{f'{steps} steps (min)':>17s} {'peak GB':>9s} {'B/sample':>9s} "
           f"{'vs slowest':>11s}")
     for r in rows:
         print(f"  {r['device_name'][:22]:22s} {r.get('impl','default'):>8s} "
-              f"{r['ms_per_step']:9.2f} "
+              f"{r.get('precision','fp32'):>6s} {r['ms_per_step']:9.2f} "
               f"{r['samples_per_s'] / 1e6:9.2f} {r.get('train_minutes', 0):17.1f} "
               f"{r['peak_alloc_gb']:9.2f} {r.get('bytes_per_sample', 0):9.0f} "
               f"{base / r['ms_per_step']:10.2f}x")
@@ -416,6 +447,8 @@ def main():
     if task == "bench":
         out = run_bench(cfg, cfg.get("name", name), device)
         suffix = "" if out["impl"] == "default" else f"_{out['impl']}"
+        if out["precision"] != "fp32":
+            suffix += f"_{out['precision']}"
         f = os.path.join(log_dir, f"bench_{out['gpu']}{suffix}.json")
         json.dump(out, open(f, "w"), indent=1)
         print(f"wrote {f}")
