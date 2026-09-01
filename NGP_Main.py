@@ -73,7 +73,19 @@ def build_from_config(cfg, shape, n_frames, device):
              frames_per_finest_cell=enc["frames_per_finest_cell"],
              lr=tr["lr"], steps=tr["steps"], batch=tr["batch"])
     torch.manual_seed(tr.get("seed", 0))
-    return page.build(p, w, h, n_frames).to(device), p
+    model = page.build(p, w, h, n_frames).to(device)
+    # THE IMPLEMENTATION AXIS, as Plexus puts it: same equations, different
+    # machinery, picked by name in the spec. "default" is the pure-PyTorch
+    # encoder; "compile" is the same graph handed to inductor; "warp" will be
+    # the hand-written kernel. Swapping one for another asserts the maths did
+    # not change, which tests/impl_gate.py checks.
+    impl = str(enc.get("implementation", "default"))
+    if impl == "compile":
+        model.encoding.forward = torch.compile(model.encoding.forward,
+                                               dynamic=False)
+    elif impl != "default":
+        raise SystemExit(f"unknown encoder.implementation {impl!r}")
+    return model, p
 
 
 def get_data(cfg, device):
@@ -174,6 +186,7 @@ def run_bench(cfg, name, device):
     fixed_gb = (sweep[-1]["peak_alloc_gb"] - per_sample * batch / 1e9) if sweep else 0.0
     out = {
         "config": name, "gpu": gpu_tag(device),
+        "impl": str(cfg["encoder"].get("implementation", "default")),
         "device_name": (torch.cuda.get_device_name(device)
                         if device.type == "cuda" else platform.processor() or "cpu"),
         "torch": torch.__version__, "cuda": torch.version.cuda,
@@ -215,6 +228,104 @@ def run_bench(cfg, name, device):
             print(f"[memory] on a {card:.0f} GB card that leaves room for a batch of "
                   f"{room * 1e9 / per_sample / 1e6:.1f} M samples at this model size",
                   flush=True)
+    return out
+
+
+def run_profile(cfg, name, device, iters=30):
+    """Where the step's time and memory go, stage by stage.
+
+    A kernel rewrite can only pay where the time is, so this is the measurement
+    that decides whether one is worth writing.  Each stage is timed in isolation
+    with the device synchronised around it, and its peak allocation is the
+    allocator's high-water mark for that stage alone -- so a stage that is cheap
+    in time and expensive in memory (a big transient) shows up as such.
+
+    The backward is split: the encoder's own backward is the scatter-add into
+    the table, which is the part a Warp kernel would replace, and it is reported
+    apart from the decoder's.
+    """
+    tr = cfg["training"]
+    vol, T, h, w, src = get_data(cfg, device)
+    model, p = build_from_config(cfg, (h, w), T, device)
+    opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]))
+    batch = int(tr["batch"])
+    enc = model.encoding
+
+    def timed(fn, n=iters):
+        fn()                                        # warm the kernels
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+        t0 = time.perf_counter()
+        for _ in range(n):
+            fn()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        dt = (time.perf_counter() - t0) / n * 1e3
+        pk = (torch.cuda.max_memory_allocated(device) / 1e9
+              if device.type == "cuda" else 0.0)
+        return dt, pk
+
+    xy = torch.rand(batch, 2, device=device)
+    ti = torch.randint(T, (batch,), device=device).float() / max(1, T - 1)
+    xyt = torch.cat([xy, ti[:, None]], 1)
+    tgt = page.sample_field(vol, xyt)
+
+    stages = []
+
+    def add(label, fn, note=""):
+        ms, gb = timed(fn)
+        stages.append({"stage": label, "ms": ms, "peak_gb": gb, "note": note})
+        print(f"  {label:26s} {ms:8.2f} ms   peak {gb:6.2f} GB   {note}", flush=True)
+
+    add("coords (rand + cat)",
+        lambda: torch.cat([torch.rand(batch, 2, device=device),
+                           (torch.randint(T, (batch,), device=device).float()
+                            / max(1, T - 1))[:, None]], 1))
+    add("target (trilinear read)", lambda: page.sample_field(vol, xyt))
+    add("encode forward", lambda: enc(xyt), f"{enc.n_levels} levels, 2^D corners each")
+    feat = enc(xyt).detach()
+    add("decoder forward", lambda: model.mlp(feat))
+    add("model forward (both)", lambda: model(xyt))
+
+    def enc_fwd_bwd():
+        f = enc(xyt)
+        f.sum().backward()
+        model.zero_grad(set_to_none=True)
+    add("encode fwd+bwd", enc_fwd_bwd, "the backward is the scatter-add")
+    # The isolated backward cannot be run without its forward, so it is reported
+    # as the difference rather than measured directly -- and said to be so,
+    # because a table of stages that sums past 100% has quietly done this.
+    fb = next(x["ms"] for x in stages if x["stage"] == "encode fwd+bwd")
+    ff = next(x["ms"] for x in stages if x["stage"] == "encode forward")
+    stages.append({"stage": "encode backward (by difference)", "ms": fb - ff,
+                   "peak_gb": 0.0, "note": "fwd+bwd minus fwd"})
+    print(f"  {'encode backward (diff)':26s} {fb - ff:8.2f} ms"
+          f"                        scatter-add alone", flush=True)
+
+    def full_step():
+        pred = model(xyt)[:, 0]
+        loss = ((pred - tgt) ** 2).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    add("full step (fwd+bwd+adam)", full_step)
+
+    def adam_only():
+        opt.step()
+    add("adam step alone", adam_only, f"{sum(q.numel() for q in model.parameters()):,} params")
+
+    total = next(x["ms"] for x in stages if x["stage"].startswith("full step"))
+    print(f"\n  the step is {total:.2f} ms; as a share of it:")
+    for x in stages:
+        if not x["stage"].startswith("full step"):
+            print(f"    {x['stage']:26s} {100 * x['ms'] / total:5.1f}%")
+    out = {"config": name, "gpu": gpu_tag(device),
+           "device_name": torch.cuda.get_device_name(device)
+           if device.type == "cuda" else "cpu",
+           "batch": batch, "stages": stages, "step_ms": total,
+           "when": time.strftime("%Y-%m-%d %H:%M:%S")}
     return out
 
 
@@ -268,11 +379,12 @@ def run_table(name, log_dir):
           f"{rows[0]['width']}x{rows[0]['height']}, "
           f"{rows[0]['n_parameters']:,} parameters, batch {rows[0]['batch']:,}\n")
     steps = rows[0].get("train_steps", 0)
-    print(f"  {'gpu':22s} {'ms/step':>9s} {'M smp/s':>9s} "
+    print(f"  {'gpu':22s} {'impl':>8s} {'ms/step':>9s} {'M smp/s':>9s} "
           f"{f'{steps} steps (min)':>17s} {'peak GB':>9s} {'B/sample':>9s} "
           f"{'vs slowest':>11s}")
     for r in rows:
-        print(f"  {r['device_name'][:22]:22s} {r['ms_per_step']:9.2f} "
+        print(f"  {r['device_name'][:22]:22s} {r.get('impl','default'):>8s} "
+              f"{r['ms_per_step']:9.2f} "
               f"{r['samples_per_s'] / 1e6:9.2f} {r.get('train_minutes', 0):17.1f} "
               f"{r['peak_alloc_gb']:9.2f} {r.get('bytes_per_sample', 0):9.0f} "
               f"{base / r['ms_per_step']:10.2f}x")
@@ -283,7 +395,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-o", "--option", nargs="+", required=True,
-                    help="<task> <config>, task in {bench, fit, table}")
+                    help="<task> <config>, task in {bench, profile, fit, table}")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--steps", type=int, default=None, help="override training.steps")
     ap.add_argument("--batch", type=int, default=None, help="override training.batch")
@@ -303,7 +415,8 @@ def main():
 
     if task == "bench":
         out = run_bench(cfg, cfg.get("name", name), device)
-        f = os.path.join(log_dir, f"bench_{out['gpu']}.json")
+        suffix = "" if out["impl"] == "default" else f"_{out['impl']}"
+        f = os.path.join(log_dir, f"bench_{out['gpu']}{suffix}.json")
         json.dump(out, open(f, "w"), indent=1)
         print(f"wrote {f}")
         run_table(cfg.get("name", name), log_dir)
@@ -312,10 +425,15 @@ def main():
         f = os.path.join(log_dir, f"fit_{out['gpu']}.json")
         json.dump(out, open(f, "w"), indent=1)
         print(f"wrote {f}")
+    elif task == "profile":
+        out = run_profile(cfg, cfg.get("name", name), device)
+        f = os.path.join(log_dir, f"profile_{out['gpu']}.json")
+        json.dump(out, open(f, "w"), indent=1)
+        print(f"wrote {f}")
     elif task == "table":
         run_table(cfg.get("name", name), log_dir)
     else:
-        sys.exit(f"unknown task {task!r}; expected bench, fit or table")
+        sys.exit(f"unknown task {task!r}; expected bench, profile, fit or table")
 
 
 if __name__ == "__main__":
