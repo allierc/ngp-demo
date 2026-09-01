@@ -99,6 +99,7 @@ def one_step(model, opt, vol, batch, device, T):
 def run_bench(cfg, name, device):
     b = cfg["benchmark"]
     tr = cfg["training"]
+    wall0 = time.perf_counter()
     vol, T, h, w, src = get_data(cfg, device)
     resident = vol.numel() * vol.element_size()
     model, p = build_from_config(cfg, (h, w), T, device)
@@ -183,6 +184,11 @@ def run_bench(cfg, name, device):
         "ms_per_step_all": [x * 1e3 for x in reps],
         "samples_per_s": batch / (ms / 1e3),
         "steps_per_s": 1e3 / ms,
+        # What the configured fit would COST on this card: the number anyone
+        # actually plans around, and the one a 5x on ms/step is worth reading as.
+        "train_minutes": int(tr["steps"]) * ms / 60_000.0,
+        "train_steps": int(tr["steps"]),
+        "bench_wall_min": (time.perf_counter() - wall0) / 60.0,
         "peak_alloc_gb": peak / 1e9,
         "peak_reserved_gb": reserved / 1e9,
         "resident_data_gb": resident / 1e9,
@@ -197,6 +203,9 @@ def run_bench(cfg, name, device):
           f"{out['peak_alloc_gb']:.2f} GB allocated / {out['peak_reserved_gb']:.2f} "
           f"reserved, of which {out['resident_data_gb']:.2f} is the resident volume",
           flush=True)
+    print(f"[time  ] {out['train_steps']:,} steps would take "
+          f"{out['train_minutes']:.1f} min on this card; the benchmark itself "
+          f"took {out['bench_wall_min']:.1f} min", flush=True)
     if per_sample:
         card = float(cfg.get("benchmark", {}).get("card_gb", 0) or 0)
         print(f"[memory] {per_sample:.0f} B per sample marginal, {fixed_gb:.2f} GB "
@@ -258,12 +267,15 @@ def run_table(name, log_dir):
     print(f"\n{name}: {rows[0]['dataset']}, {rows[0]['frames']} frames of "
           f"{rows[0]['width']}x{rows[0]['height']}, "
           f"{rows[0]['n_parameters']:,} parameters, batch {rows[0]['batch']:,}\n")
-    print(f"  {'gpu':22s} {'ms/step':>9s} {'M samples/s':>12s} {'peak GB':>9s} "
-          f"{'data GB':>8s} {'vs slowest':>11s}")
+    steps = rows[0].get("train_steps", 0)
+    print(f"  {'gpu':22s} {'ms/step':>9s} {'M smp/s':>9s} "
+          f"{f'{steps} steps (min)':>17s} {'peak GB':>9s} {'B/sample':>9s} "
+          f"{'vs slowest':>11s}")
     for r in rows:
         print(f"  {r['device_name'][:22]:22s} {r['ms_per_step']:9.2f} "
-              f"{r['samples_per_s'] / 1e6:12.2f} {r['peak_alloc_gb']:9.2f} "
-              f"{r['resident_data_gb']:8.2f} {base / r['ms_per_step']:10.2f}x")
+              f"{r['samples_per_s'] / 1e6:9.2f} {r.get('train_minutes', 0):17.1f} "
+              f"{r['peak_alloc_gb']:9.2f} {r.get('bytes_per_sample', 0):9.0f} "
+              f"{base / r['ms_per_step']:10.2f}x")
     print()
 
 
