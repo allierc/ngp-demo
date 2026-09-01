@@ -80,6 +80,7 @@ def fit_and_score(cfg, vol, truth, hit, device, steps):
     n_enc, n_mlp = model.n_parameters()
     return {
         "rmse": float(d.pow(2).mean().sqrt()),
+        "rmse_struck": float(d[hit].pow(2).mean().sqrt()),
         "offset_struck": float(d[hit].mean()),
         "rmse_clean": float(d[~hit].pow(2).mean().sqrt()),
         "psnr_vs_corrupt": float(main_mod.psnr(out, vol)),
@@ -105,13 +106,13 @@ def _one_table(rows, mode):
     print(f"\n  {mode}: amplitude {rows[0]['amp']:.4g}, {rows[0]['steps']} steps, "
           f"{rows[0]['config']}\n")
     print(f"  {'L':>3s} {'log2T':>6s} {'px':>3s} {'frames':>7s} {'params':>10s} "
-          f"{'RMSE vs truth':>14s} {'offset struck':>14s} {'RMSE clean':>11s} "
+          f"{'RMSE vs truth':>14s} {'RMSE stripes':>13s} {'RMSE clean':>11s} "
           f"{'fit s':>7s} {'axis':>8s}")
     for r in rows:
         mark = " *" if r.get("is_baseline") else ""
         print(f"  {r['levels']:3d} {r['log2t']:6d} {r['px']:3d} {r['frames']:7d} "
               f"{r['n_parameters'] / 1e6:9.1f}M {r['rmse']:14.3f} "
-              f"{r['offset_struck']:14.3f} {r['rmse_clean']:11.3f} "
+              f"{r.get('rmse_struck', float('nan')):13.3f} {r['rmse_clean']:11.3f} "
               f"{r['train_s']:7.1f} {r.get('axis', '-') + mark:>8s}")
     if ref:
         b = ref[0]

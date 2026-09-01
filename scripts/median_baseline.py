@@ -180,8 +180,8 @@ def write_mp4(raw, recon, path, label, lo, hi, err_max, fps=MP4_FPS):
             uris = (field_png(a, 0.0, lo=lo, hi=hi),
                     field_png(b, 0.0, lo=lo, hi=hi),
                     png_data_uri(signed_rgb(b - a, err_max)))
-            tiles = [np.asarray(Image.open(io.BytesIO(
-                base64.b64decode(u.split(",", 1)[1]))).convert("RGB")) for u in uris]
+            tiles = [_upscale(np.asarray(Image.open(io.BytesIO(
+                base64.b64decode(u.split(",", 1)[1]))).convert("RGB"))) for u in uris]
             h, wd, _ = tiles[0].shape
             bar = 16
             im = Image.fromarray(np.zeros((3 * (h + bar), wd, 3), np.uint8))
@@ -197,6 +197,11 @@ def write_mp4(raw, recon, path, label, lo, hi, err_max, fps=MP4_FPS):
     print(f"[mp4   ] {T} frames at {fps} fps -> {path} "
           f"({os.path.getsize(path) / 1e6:.1f} MB, {time.perf_counter() - t0:.0f} s)",
           flush=True)
+
+
+def _upscale(tile, target=440):
+    f = max(1, int(round(target / max(1, tile.shape[0]))))
+    return tile if f == 1 else np.repeat(np.repeat(tile, f, 0), f, 1)
 
 
 def write_grid_mp4(panels, labels, path, lo, hi, err_max, residual=None,
@@ -222,8 +227,8 @@ def write_grid_mp4(panels, labels, path, lo, hi, err_max, residual=None,
                 else:
                     u = png_data_uri(signed_rgb(a - residual[i].cpu().numpy(),
                                                 err_max))
-                tiles.append(np.asarray(Image.open(io.BytesIO(
-                    base64.b64decode(u.split(",", 1)[1]))).convert("RGB")))
+                tiles.append(_upscale(np.asarray(Image.open(io.BytesIO(
+                    base64.b64decode(u.split(",", 1)[1]))).convert("RGB"))))
             h, wd, _ = tiles[0].shape
             bar, gap = 16, 4
             im = Image.fromarray(np.zeros((2 * (h + bar) + gap, 2 * wd + gap, 3),
@@ -349,6 +354,16 @@ def inject(vol, p, amp, seed=0):
     return vol + hit.to(vol.dtype) * amp, hit.expand(T, H, W)
 
 
+def fps_for(a, T):
+    """Frames per second that makes the file last `--seconds`.
+
+    A movie is watched at whatever length it is, not at whatever rate it was
+    written, and two clips of different frame counts compared side by side
+    should end together.
+    """
+    return MP4_FPS if a.seconds <= 0 else max(1.0, T / a.seconds)
+
+
 def run_modes(vol, a, device, lo, hi, err_max, tag):
     """Every artefact against every method, on a clean video.
 
@@ -361,13 +376,14 @@ def run_modes(vol, a, device, lo, hi, err_max, tag):
     print(f"\n[modes ] clean truth: {tuple(vol.shape)}, values {float(vol.min()):.3g}"
           f" to {float(vol.max()):.3g}; artefact amplitude {amp:.4g}\n")
     print(f"  {'artefact':>12s} {'method':>12s} {'RMSE vs truth':>14s} "
-          f"{'offset struck':>14s} {'RMSE clean px':>14s} {'vs doing nothing':>17s}")
+          f"{'RMSE on stripes':>16s} {'RMSE where clean':>17s} {'vs doing nothing':>17s}")
     for mode in a.modes:
         corrupt, hit = corrupt_by(mode, vol, amp)
         base = float((corrupt - vol).pow(2).mean().sqrt())
         clean_n = int((~hit).sum())
         print(f"  {mode:>12s} {'uncorrected':>12s} {base:14.4f} "
-              f"{float((corrupt - vol)[hit].mean()):14.4f} {0.0:14.4f} {'':>17s}")
+              f"{float((corrupt - vol)[hit].pow(2).mean().sqrt()):16.4f} "
+              f"{0.0:17.4f} {'':>17s}")
         recs = [(f"median k={k}", median_stack(corrupt, k)) for k in a.windows]
         if a.ngp:
             rec, _, _ = ngp_recon(a.ngp, corrupt, device)
@@ -376,8 +392,39 @@ def run_modes(vol, a, device, lo, hi, err_max, tag):
             d = rec - vol
             r = float(d.pow(2).mean().sqrt())
             cl = float(d[~hit].pow(2).mean().sqrt()) if clean_n else float("nan")
-            print(f"  {'':>12s} {label:>12s} {r:14.4f} {float(d[hit].mean()):14.4f} "
-                  f"{cl:14.4f} {base / max(r, 1e-9):16.2f}x")
+            print(f"  {'':>12s} {label:>12s} {r:14.4f} "
+                  f"{float(d[hit].pow(2).mean().sqrt()):16.4f} {cl:17.4f} "
+                  f"{base / max(r, 1e-9):16.2f}x")
+        if not a.no_mp4:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            slug = mode.replace(":", "")
+            # One scale for every panel, taken from the errors themselves: the
+            # page's +-5% of span is the size of a fit's own residual, and these
+            # errors are the size of the artefact that was added.
+            em = max(1e-9, float(torch.quantile(
+                torch.stack([(r - vol).abs().flatten()[::13] for _, r in recs] +
+                            [(corrupt - vol).abs().flatten()[::13]]).flatten(), 0.999)))
+            names = [l for l, _ in recs]
+            best_med = min([r for r in recs if r[0].startswith("median")],
+                           key=lambda r: float((r[1] - vol).pow(2).mean()))
+            keep = [("truth", vol), ("corrupted", corrupt), best_med,
+                    recs[-1] if a.ngp else recs[0]]
+            write_grid_mp4([v for _, v in keep], [n for n, _ in keep],
+                           os.path.join(a.out, f"{tag}_{slug}_montage_{stamp}.mp4"),
+                           lo, hi, em, fps=fps_for(a, vol.shape[0]))
+            # THE ERROR GRID READS ACROSS THE TOP. Top-left is the artefact
+            # itself -- corrupted minus truth is exactly what was injected, the
+            # thing every method is being asked to remove -- and top-right is
+            # the fit, so the pair the argument is about sits side by side. The
+            # two medians go underneath, shortest and longest window, which is
+            # the axis along which a median trades artefact for signal.
+            meds = [r for r in recs if r[0].startswith("median")]
+            err = [("corrupted", corrupt), recs[-1] if a.ngp else meds[0],
+                   meds[0], meds[-1]]
+            write_grid_mp4([v for _, v in err[:4]],
+                           [f"{n} - truth" for n, _ in err[:4]],
+                           os.path.join(a.out, f"{tag}_{slug}_montage_err_{stamp}.mp4"),
+                           lo, hi, em, residual=vol, fps=fps_for(a, vol.shape[0]))
         del corrupt, hit, recs
     print("\n  the last column is the error of doing nothing divided by the error"
           "\n  of the method: above 1 it helped, below 1 it made the data worse.\n")
@@ -390,12 +437,12 @@ def run_injection(vol, a, device, lo, hi, err_max, tag):
     print(f"\n[inject] one-sided row stripes of {amp:.2f} "
           f"({100 * amp / span:.1f}% of the display span), flickering every frame\n")
     print(f"  {'duty':>6s} {'method':>12s} {'RMSE vs truth':>14s} "
-          f"{'offset at struck px':>20s} {'RMSE where clean':>17s}")
+          f"{'RMSE on stripes':>20s} {'RMSE where clean':>17s}")
     for p in a.duty:
         corrupt, hit = inject(vol, p, amp)
         base = float((corrupt - vol).pow(2).mean().sqrt())
         print(f"  {p:6.2f} {'uncorrected':>12s} {base:14.3f} "
-              f"{float((corrupt - vol)[hit].mean()):20.3f} {0.0:17.3f}")
+              f"{float((corrupt - vol)[hit].pow(2).mean().sqrt()):20.3f} {0.0:17.3f}")
         recs = [(f"median k={k}", median_stack(corrupt, k)) for k in a.windows]
         if a.ngp:
             rec, _, _ = ngp_recon(a.ngp, corrupt, device)
@@ -403,7 +450,7 @@ def run_injection(vol, a, device, lo, hi, err_max, tag):
         for label, rec in recs:
             d = rec - vol
             print(f"  {'':6s} {label:>12s} {float(d.pow(2).mean().sqrt()):14.3f} "
-                  f"{float(d[hit].mean()):20.3f} "
+                  f"{float(d[hit].pow(2).mean().sqrt()):20.3f} "
                   f"{float(d[~hit].pow(2).mean().sqrt()):17.3f}")
         # The movies are written for ONE duty cycle, the last asked for, because
         # this is where the argument is decided and four more files of the easy
@@ -443,10 +490,10 @@ def run_injection(vol, a, device, lo, hi, err_max, tag):
                                         f"{tag}_inject{p:.1f}_montage_err_{stamp}.mp4"),
                            lo, hi, err_max, residual=vol)
         del corrupt, hit, recs
-    print("\n  'offset at struck pixels' is the signed error left where the stripe"
-          "\n  was: 0 means the artefact was removed and nothing was put in its"
-          "\n  place. 'RMSE where clean' is the damage done to pixels the artefact"
-          "\n  never touched -- the price of the filtering, paid everywhere.\n")
+    print("\n  the two RMSE columns split the same error by where it happened:"
+          "\n  'on stripes' is what is left where the artefact was put, and"
+          "\n  'where clean' is the damage done to pixels it never touched --"
+          "\n  what the filtering cost, paid everywhere.\n")
 
 
 def main():
@@ -466,6 +513,8 @@ def main():
     ap.add_argument("--amp", type=float, default=0.0,
                     help="stripe amplitude; 0 = 2.5x the frame-to-frame std")
     ap.add_argument("--no-mp4", action="store_true")
+    ap.add_argument("--seconds", type=float, default=0.0,
+                    help="make every mp4 last this long; 0 keeps the page's 30 fps")
     ap.add_argument("--montage", action="store_true",
                     help="one 2x2 mp4 of raw/ngp/two medians, and one of their "
                          "residuals, instead of a movie per window")
