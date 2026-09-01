@@ -166,6 +166,23 @@ def datasets(pattern=None):
     return out
 
 
+def _default_field(stores):
+    """Which dataset the page opens on: the real imaging when it is there.
+
+    zapbench consecutive first, then any other prepared dataset, then the toy
+    sum -- the toy is what the page was written against, but it is not what
+    anyone opens it for once real data is on disk.
+    """
+    for k in ("zapbench consecutive",):
+        if k in stores:
+            return k
+    real = [k for k in stores if not k.startswith(("u ", "coarse ", "fine "))]
+    if real:
+        return sorted(real)[0]
+    return next((k for k in stores if k.startswith("u ")),
+                next(iter(stores), "u 64 + v"))
+
+
 DATASETS = datasets()
 DEFAULT_ZARR = DATASETS.get("sum") or next(iter(DATASETS.values()), "")
 
@@ -567,6 +584,51 @@ def _prefetch(token, budget=1024):
         PLAY["ready"] = i + 1
     print(f"[play  ] {n} frames cached, playback is now local", flush=True)
 
+
+MP4_FPS = 30                     # what the page's x1 plays at, near enough
+
+
+def _save_mp4(tag):
+    """The run as an mp4: raw on top, the fit under it, the residual below that.
+
+    Built from the SAME pictures the page shows -- the cached data URIs, decoded
+    -- so the file cannot disagree with the panels.  Stacked rather than side by
+    side because these frames are wider than they are tall, and a column of
+    three keeps each one large.  x1, which is the page's own playback rate and
+    not the microscope's: 256 zapbench frames are 0.914 s apart, so real time
+    would be four minutes of almost nothing moving.
+    """
+    import imageio.v2 as imageio
+    n = PLAY["n_frames"]
+    out_dir = os.path.join(ROOT, "out")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{tag}_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+    labels = ("raw", "ngp fit", "residual")
+    t0 = time.perf_counter()
+    with imageio.get_writer(path, fps=MP4_FPS, macro_block_size=None) as w:
+        for i in range(n):
+            tiles = [np.asarray(Image.open(io.BytesIO(
+                base64.b64decode(u.split(",", 1)[1]))).convert("RGB"))
+                for u in _frame_pngs(i)]
+            h, wd, _ = tiles[0].shape
+            bar = 16
+            sheet = np.zeros((3 * (h + bar), wd, 3), np.uint8)
+            im = Image.fromarray(sheet)
+            d = ImageDraw.Draw(im)
+            for j, (tile, lab) in enumerate(zip(tiles, labels)):
+                y = j * (h + bar)
+                d.text((4, y + 3), f"{lab}   frame {i + 1}/{n}", fill=(255, 255, 255))
+                im.paste(Image.fromarray(tile), (0, y + bar))
+            a = np.asarray(im)
+            if a.shape[0] % 2 or a.shape[1] % 2:      # h264 wants even sides
+                a = a[:a.shape[0] // 2 * 2, :a.shape[1] // 2 * 2]
+            w.append_data(a)
+    print(f"[mp4   ] {n} frames at {MP4_FPS} fps -> {path} "
+          f"({os.path.getsize(path) / 1e6:.1f} MB, {time.perf_counter() - t0:.0f} s)",
+          flush=True)
+    return path
+
+
 def train_job(p, device):
     try:
         down = max(1, int(p["downsample"]))
@@ -696,7 +758,7 @@ def train_job(p, device):
                     JOB["stamp"] += 1
         PLAY.update(model=model, vol=vol, n_frames=n_frames, vmax=vmax,
                     lo=lo, hi=hi, err_max=err_max, h=h, w=w, device=device,
-                    cache={}, ready=0)
+                    cache={}, ready=0, tag=p["field"].replace(" ", "_"))
         threading.Thread(target=_prefetch, args=(PLAY.get("token"),),
                          daemon=True).start()
     except Exception as e:
@@ -721,9 +783,9 @@ def psnr_db(mse, vmax):
 KNOBS = {
     "field": [
         {"name": "n_levels", "label": "levels L", "min": 2, "max": 16,
-         "default": 7, "step": 1},
+         "default": 16, "step": 1},
         {"name": "log2_hashmap_size", "label": "max entries per level T",
-         "min": 10, "max": 24, "default": 20, "step": 1, "pow2": True},
+         "min": 10, "max": 24, "default": 22, "step": 1, "pow2": True},
         # 4 px per cell, because the fine component measures 15 px per cycle
         # inside a disc and two cells per cycle is the floor.
         {"name": "px_per_finest_cell", "label": "px per finest cell",
@@ -745,8 +807,7 @@ KNOBS = {
     ],
 }
 DEFAULTS = {k["name"]: k.get("default") for g in KNOBS.values() for k in g}
-DEFAULTS.update(field=next((k for k in DATASETS if k.startswith("u ")),
-                          next(iter(DATASETS), "u 64 + v")),
+DEFAULTS.update(field=_default_field(DATASETS),
                 downsample=1, coarse_to_fine=0, holdout=1)
 
 
@@ -769,7 +830,7 @@ same encoder, and the generator writes all three as separate runs &mdash; the
   <div class="seg"><button id="run">run</button><button id="stop">stop</button></div>
 </div>
 <div class="group"><div class="label">&nbsp;</div>
-  <div class="seg" id="playseg" style="display:none"><button id="play">play</button>
+  <div class="seg" id="playseg" style="display:none"><button id="play">play</button><button id="savemp4">save mp4</button>
     <button class="sp" data-s="0.5">x0.5</button><button class="sp" data-s="1"
     aria-pressed="true">x1</button><button class="sp" data-s="2">x2</button>
     <button class="sp" data-s="4">x4</button></div>
@@ -1097,6 +1158,15 @@ async function playStep(){
   PLAYAT = (r.i + 1) % r.n;
   setTimeout(playStep, 40);
 }
+
+document.getElementById("savemp4").onclick=async()=>{
+  const b=document.getElementById("savemp4");
+  b.disabled=true; b.textContent="saving...";
+  const r=await (await fetch("/api/save_mp4")).json();
+  b.disabled=false; b.textContent="save mp4";
+  document.getElementById("playnote").textContent =
+    r.error ? r.error : "wrote " + r.path;
+};
 document.getElementById("play").onclick=()=>{
   PLAYING = !PLAYING;
   document.getElementById("play").textContent = PLAYING ? "pause" : "play";
@@ -1165,6 +1235,17 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/clienterror":
             print(f"[client] {q.get('msg', '')}", flush=True)
             return self._send(json.dumps({"ok": True}), "application/json")
+        if u.path == "/api/save_mp4":
+            if not PLAY:
+                return self._send(json.dumps({"error": "no finished fit"}),
+                                  "application/json")
+            try:
+                path = _save_mp4(PLAY.get("tag", "run"))
+                return self._send(json.dumps({"path": path}), "application/json")
+            except Exception as e:
+                print(f"[mp4   ] failed: {type(e).__name__}: {e}", flush=True)
+                return self._send(json.dumps({"error": f"{type(e).__name__}: {e}"}),
+                                  "application/json")
         if u.path == "/api/frame":
             # One frame, target and fit, rendered on demand: 201 frames of two
             # panels is a lot of png to send for something watched once.
@@ -1221,8 +1302,7 @@ def main():
               flush=True)
     # "sum" even when nothing is on disk: the page rescans on every run, so the
     # selector has to hold a name until a store appears.
-    DEFAULTS["field"] = next((k for k in DATASETS if k.startswith("u ")),
-                             sorted(DATASETS)[0] if DATASETS else "u 64 + v")
+    DEFAULTS["field"] = _default_field(DATASETS)
     Handler.device = torch.device(a.device)
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)

@@ -37,6 +37,7 @@ import matplotlib
 matplotlib.use("Agg")
 import numpy as np
 import torch
+from PIL import Image, ImageDraw
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -120,6 +121,51 @@ def _prefetch(token, budget=1024):
             return
         PLAY["ready"] = i + 1
     print(f"[play  ] {n} frames cached, playback is now local", flush=True)
+
+
+MP4_FPS = 30                     # what the page's x1 plays at, near enough
+
+
+def _save_mp4(tag):
+    """The run as an mp4: raw on top, the fit under it, the residual below that.
+
+    Built from the SAME pictures the page shows -- the cached data URIs, decoded
+    -- so the file cannot disagree with the panels.  Stacked rather than side by
+    side because these frames are wider than they are tall, and a column of
+    three keeps each one large.  x1, which is the page's own playback rate and
+    not the microscope's: 256 zapbench frames are 0.914 s apart, so real time
+    would be four minutes of almost nothing moving.
+    """
+    import imageio.v2 as imageio
+    n = PLAY["n_frames"]
+    out_dir = os.path.join(ROOT, "out")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{tag}_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+    labels = ("raw", "ngp fit", "residual")
+    t0 = time.perf_counter()
+    with imageio.get_writer(path, fps=MP4_FPS, macro_block_size=None) as w:
+        for i in range(n):
+            tiles = [np.asarray(Image.open(io.BytesIO(
+                base64.b64decode(u.split(",", 1)[1]))).convert("RGB"))
+                for u in _frame_pngs(i)]
+            h, wd, _ = tiles[0].shape
+            bar = 16
+            sheet = np.zeros((3 * (h + bar), wd, 3), np.uint8)
+            im = Image.fromarray(sheet)
+            d = ImageDraw.Draw(im)
+            for j, (tile, lab) in enumerate(zip(tiles, labels)):
+                y = j * (h + bar)
+                d.text((4, y + 3), f"{lab}   frame {i + 1}/{n}", fill=(255, 255, 255))
+                im.paste(Image.fromarray(tile), (0, y + bar))
+            a = np.asarray(im)
+            if a.shape[0] % 2 or a.shape[1] % 2:      # h264 wants even sides
+                a = a[:a.shape[0] // 2 * 2, :a.shape[1] // 2 * 2]
+            w.append_data(a)
+    print(f"[mp4   ] {n} frames at {MP4_FPS} fps -> {path} "
+          f"({os.path.getsize(path) / 1e6:.1f} MB, {time.perf_counter() - t0:.0f} s)",
+          flush=True)
+    return path
+
 
 def train_job(cfg, p, device):
     try:
@@ -246,7 +292,8 @@ def train_job(cfg, p, device):
                     JOB["levels"] = levels
                     JOB["stamp"] += 1
         PLAY.update(model=model, gt=gt, src=src, shape=shape,
-                    n_frames=n_frames, device=device, cache={}, ready=0)
+                    n_frames=n_frames, device=device, cache={},
+                    ready=0, tag="moving_band")
         threading.Thread(target=_prefetch, args=(PLAY.get("token"),),
                          daemon=True).start()
     except Exception as e:
@@ -763,6 +810,15 @@ async function playStep(){
   PLAYAT = (r.i + 2) % r.n;
   setTimeout(playStep, 40);
 }
+
+document.getElementById("savemp4").onclick=async()=>{
+  const b=document.getElementById("savemp4");
+  b.disabled=true; b.textContent="saving...";
+  const r=await (await fetch("/api/save_mp4")).json();
+  b.disabled=false; b.textContent="save mp4";
+  document.getElementById("playnote").textContent =
+    r.error ? r.error : "wrote " + r.path;
+};
 document.getElementById("play").onclick=()=>{
   PLAYING = !PLAYING;
   document.getElementById("play").textContent = PLAYING ? "pause" : "play";
@@ -848,6 +904,17 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/stop":
             STOP.set()
             return self._send(json.dumps({"ok": True}), "application/json")
+        if u.path == "/api/save_mp4":
+            if not PLAY:
+                return self._send(json.dumps({"error": "no finished fit"}),
+                                  "application/json")
+            try:
+                path = _save_mp4(PLAY.get("tag", "run"))
+                return self._send(json.dumps({"path": path}), "application/json")
+            except Exception as e:
+                print(f"[mp4   ] failed: {type(e).__name__}: {e}", flush=True)
+                return self._send(json.dumps({"error": f"{type(e).__name__}: {e}"}),
+                                  "application/json")
         if u.path == "/api/frame":
             # One frame of the run, target and fit, rendered on demand. The page
             # asks for them one at a time rather than being sent a movie: 800
