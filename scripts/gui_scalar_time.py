@@ -395,16 +395,66 @@ def level_montage(model, h, w, t, device, side=110, cols=4):
     finally:
         enc.set_level_window(float(enc.n_levels))
 
+    return _sheet(tiles, labels, cols)
+
+
+@torch.no_grad()
+def level_kymograph(model, h, w, n_frames, device, side=110, cols=4):
+    """The temporal pendant of the level montage: what each level adds, in TIME.
+
+    One horizontal line through the field -- the row through two of the discs --
+    swept over every frame, so each tile is x across and t down.  The spatial
+    montage answers where a level works; this answers when, and on a field whose
+    two components differ by an order of magnitude in time (lag-1
+    autocorrelation 0.998 against 0.829) that is the other half of the question.
+
+    A level's own time resolution is printed with it: `resolutions[l][2]` cells
+    along t, which is how many frames one cell of that level spans.
+    """
+    enc = model.encoding
+    ny = max(16, min(side, n_frames))
+    nx = max(16, side)
+    y = torch.full((nx * ny,), 0.5, device=device)
+    xs = pixel_centers(1, nx, device)[:, 0].repeat(ny)
+    ts = torch.arange(ny, device=device).float().repeat_interleave(nx) / max(1, ny - 1)
+    xyt = torch.stack([xs, y, ts], dim=1)
+    cache = {}
+
+    def upto(k):
+        if k not in cache:
+            enc.set_level_window(float(max(0, k + 1)) if k >= 0 else 0.0)
+            cache[k] = model(xyt)[:, 0].reshape(ny, nx)
+        return cache[k]
+
+    levels = list(range(enc.n_levels))[-(cols * cols - 1):]
+    tiles, labels = [], []
+    try:
+        b0 = levels[0] - 1
+        a = upto(b0)
+        v = np.clip(a.cpu().numpy() / max(1e-6, float(a.abs().max())), -1, 1) * .5 + .5
+        tiles.append((matplotlib.colormaps["viridis"](v)[..., :3] * 255).astype(np.uint8))
+        labels.append(f"0..{b0}")
+        for l in levels:
+            d = upto(l) - upto(l - 1)
+            tiles.append(signed_rgb(d.cpu().numpy(), MONTAGE_LUT_MAX))
+            labels.append(f"L{l} / {enc.resolutions[l][2]}t")
+    finally:
+        enc.set_level_window(float(enc.n_levels))
+    return _sheet(tiles, labels, cols)
+
+
+def _sheet(tiles, labels, cols=4, gap=2):
+    """Tiles into one labelled picture."""
     th, tw, _ = tiles[0].shape
     rows = (len(tiles) + cols - 1) // cols
-    sheet = np.zeros((rows * (th + 2) - 2, cols * (tw + 2) - 2, 3), np.uint8)
+    sheet = np.zeros((rows * (th + gap) - gap, cols * (tw + gap) - gap, 3), np.uint8)
     for i, tile in enumerate(tiles):
-        y, x = (i // cols) * (th + 2), (i % cols) * (tw + 2)
+        y, x = (i // cols) * (th + gap), (i % cols) * (tw + gap)
         sheet[y:y + th, x:x + tw] = tile
     im = Image.fromarray(sheet)
     dr = ImageDraw.Draw(im)
     for i, lab in enumerate(labels):
-        dr.text(((i % cols) * (tw + 2) + 2, (i // cols) * (th + 2) + 1), lab,
+        dr.text(((i % cols) * (tw + gap) + 2, (i // cols) * (th + gap) + 1), lab,
                 fill=(255, 255, 255))
     buf = io.BytesIO()
     im.save(buf, format="PNG")
@@ -496,6 +546,7 @@ def train_job(p, device):
                                                   fr / max(1, n_frames - 1), device)
                     imgs["montage"] = level_montage(
                         model, h, w, picks[1] / max(1, n_frames - 1), device)
+                    imgs["kymo"] = level_kymograph(model, h, w, n_frames, device)
                     # every frame, on a coarse grid: cheap, and the only way to
                     # see a fit that is good at the ends and lost in between
                     hs, ws = h // 4, w // 4
@@ -548,7 +599,7 @@ def psnr_db(mse, vmax):
 KNOBS = {
     "field": [
         {"name": "n_levels", "label": "levels L", "min": 2, "max": 16,
-         "default": 16, "step": 1},
+         "default": 7, "step": 1},
         {"name": "log2_hashmap_size", "label": "max entries per level T",
          "min": 10, "max": 24, "default": 20, "step": 1, "pow2": True},
         # 4 px per cell, because the fine component measures 15 px per cycle
@@ -632,9 +683,14 @@ same encoder, and the generator writes all three as separate runs &mdash; the
     <div class="cap">levels</div></div>
   <div class="panel"><canvas id="c_lev2" width="300" height="300"></canvas>
     <div class="cap">levels</div></div>
+</div>
+<div class="row grid3" style="margin-top:8px">
   <div class="panel"><canvas id="c_montage" width="300" height="300"></canvas>
-    <div class="cap">what each level adds, middle frame &mdash; signed,
+    <div class="cap">what each level adds in SPACE, middle frame &mdash; signed,
       fixed &plusmn;__MONTMAX__</div></div>
+  <div class="panel"><canvas id="c_kymo" width="300" height="300"></canvas>
+    <div class="cap">what each level adds in TIME &mdash; x across, t down,
+      through the middle row; the label gives the level's cells along t</div></div>
 </div>
 <div id="levlegend" class="note"></div>
 <div class="row" style="margin-top:14px">
@@ -861,6 +917,7 @@ async function poll(){
       drawLevels("c_lev"+i, LASTLEV[String(i)], "c_target"+i);
     }
     drawImg("c_montage", (r.images||{}).montage);
+    drawImg("c_kymo", (r.images||{}).kymo);
     drawCurve(r.curve); drawFrames(r.per_frame);
     document.getElementById("stats").innerHTML = m.psnr===undefined ? "press run"
       : `iteration <b>${r.step}</b> / ${r.steps} &nbsp;&middot;&nbsp; `
