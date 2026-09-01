@@ -56,7 +56,8 @@ from ngp import NGPField
 from ngp.utils import pixel_centers, render
 from PIL import Image, ImageDraw
 
-from ngp.webui import ABOUT_HTML, CSS, cmap_png, field_png, signed_rgb, png_data_uri
+from ngp.webui import (ABOUT_HTML, CSS, cmap_png, display_range,
+                        field_png, png_data_uri, signed_rgb)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The generator writes one store per run and names the directory after it, so a
@@ -490,6 +491,13 @@ def train_job(p, device):
         down = max(1, int(p["downsample"]))
         vol, n_frames, h, w, store = load_field(p["field"], down, device)
         vmax = float(vol.abs().max())
+        # The colour range comes from the DATA, not from its extreme: a redox
+        # ratio runs to 2.88 with a 99.9th percentile of 1.24, and a symmetric
+        # ramp on the extreme spends itself on values that never occur. The
+        # error scale follows it -- 5% of the displayed span -- rather than
+        # being a constant that suits one dataset.
+        lo, hi = display_range(vol)
+        err_max = max(1e-6, 0.05 * (hi - lo))
         PLAY.clear()
         torch.manual_seed(0)
         model = build(p, w, h, n_frames).to(device)
@@ -508,7 +516,7 @@ def train_job(p, device):
         note = (f"{p['field']} dataset "
                 f"({os.path.basename(os.path.dirname(store))}), "
                 f"{n_frames} frames of {w}x{h}, "
-                f"values +-{vmax:.2f}; "
+                f"shown {lo:.2f}..{hi:.2f} of {float(vol.min()):.2f}..{float(vol.max()):.2f}, error +-{err_max:.3f}; "
                 f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells in "
                 f"space ({w / enc.resolutions[-1][0]:.1f} px per finest cell), "
                 f"{enc.resolutions[-1][2]} cells along t of {n_frames} frames "
@@ -531,7 +539,7 @@ def train_job(p, device):
                                 "n_frames": n_frames, "vmax": vmax,
                                 "n_held": len(held)},
                        images={f"target{i}": field_png(
-                           vol[t].cpu().numpy(), vmax)
+                           vol[t].cpu().numpy(), vmax, lo=lo, hi=hi)
                            for i, t in enumerate(picks)},
                        stamp=JOB["stamp"] + 1)
 
@@ -564,9 +572,10 @@ def train_job(p, device):
                         c = frame_coords(h, w, fr / max(1, n_frames - 1), device)
                         fit = render(model, c, (h, w))
                         d = (fit - vol[fr])
-                        imgs[f"fit{i}"] = field_png(fit.cpu().numpy(), vmax)
+                        imgs[f"fit{i}"] = field_png(fit.cpu().numpy(), vmax,
+                                                    lo=lo, hi=hi)
                         imgs[f"err{i}"] = png_data_uri(
-                            signed_rgb(d.cpu().numpy(), ERROR_LUT_MAX))
+                            signed_rgb(d.cpu().numpy(), err_max))
                         errs.append(float(d.pow(2).mean()))
                         lv[str(i)] = level_map_at(model, h, w,
                                                   fr / max(1, n_frames - 1), device)
@@ -602,7 +611,7 @@ def train_job(p, device):
                     JOB["levels"] = lv
                     JOB["stamp"] += 1
         PLAY.update(model=model, vol=vol, n_frames=n_frames, vmax=vmax,
-                    h=h, w=w, device=device)
+                    lo=lo, hi=hi, h=h, w=w, device=device)
     except Exception as e:
         print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
         with LOCK:
@@ -696,7 +705,8 @@ same encoder, and the generator writes all three as separate runs &mdash; the
 </div>
 <div class="row equal" style="margin-top:8px">
   <div class="panel"><canvas id="c_err0" width="300" height="300"></canvas>
-    <div class="cap">fit &minus; target &mdash; blue/red, fixed &plusmn;__ERRMAX__</div></div>
+    <div class="cap">fit &minus; target &mdash; blue/red, fixed at 5% of the
+      shown range</div></div>
   <div class="panel"><canvas id="c_err1" width="300" height="300"></canvas>
     <div class="cap">error</div></div>
   <div class="panel"><canvas id="c_err2" width="300" height="300"></canvas>
@@ -1066,8 +1076,10 @@ class Handler(BaseHTTPRequestHandler):
                 fit = render(PLAY["model"], c, (PLAY["h"], PLAY["w"]))
             return self._send(json.dumps(
                 {"i": i, "n": PLAY["n_frames"],
-                 "target": field_png(PLAY["vol"][i].cpu().numpy(), PLAY["vmax"]),
-                 "fit": field_png(fit.cpu().numpy(), PLAY["vmax"])}),
+                 "target": field_png(PLAY["vol"][i].cpu().numpy(), PLAY["vmax"],
+                                     lo=PLAY["lo"], hi=PLAY["hi"]),
+                 "fit": field_png(fit.cpu().numpy(), PLAY["vmax"],
+                                  lo=PLAY["lo"], hi=PLAY["hi"])}),
                 "application/json")
         if u.path == "/api/state":
             with LOCK:
