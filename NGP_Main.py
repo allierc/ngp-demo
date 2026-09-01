@@ -97,6 +97,24 @@ def build_from_config(cfg, shape, n_frames, device):
     if impl == "compile":
         model.encoding.forward = torch.compile(model.encoding.forward,
                                                dynamic=False)
+    elif impl == "warp":
+        # Built from the default encoder's own ladder rather than from the yaml
+        # again, so the two cannot drift: same resolutions, same offsets, same
+        # dense/hashed split, and the table copied across.
+        from ngp.hashgrid_warp import WarpHashGrid
+        e = model.encoding
+        w = WarpHashGrid(n_input_dims=e.n_input_dims, n_levels=e.n_levels,
+                         n_features_per_level=e.n_features_per_level,
+                         log2_hashmap_size=int(enc["log2_hashmap_size"]),
+                         base_resolution=list(e.resolutions[0]),
+                         per_level_scale=list(e.per_level_scale),
+                         max_resolution=list(e.resolutions[-1]),
+                         interpolation=e.interpolation).to(device)
+        assert w.n_entries == e.n_entries and w.resolutions == e.resolutions, (
+            "the warp ladder does not match the default one")
+        with torch.no_grad():
+            w.table.copy_(e.table)
+        model.encoding = w
     elif impl != "default":
         raise SystemExit(f"unknown encoder.implementation {impl!r}")
     return model, p
