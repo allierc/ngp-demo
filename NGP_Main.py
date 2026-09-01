@@ -54,6 +54,28 @@ def load_config(name):
         return yaml.safe_load(f), path
 
 
+def other_processes(device):
+    """MB held on this GPU by processes that are not us.
+
+    A shared card makes a benchmark lie quietly: the same config measured 17.75
+    ms alone and 35.60 ms beside two other jobs, and nothing in the number says
+    which. Recorded with every result so a row can be discarded rather than
+    believed.
+    """
+    if device.type != "cuda":
+        return 0
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader,nounits"], capture_output=True, text=True,
+            timeout=10).stdout
+        mine = os.getpid()
+        return sum(int(l.split(",")[1]) for l in out.strip().splitlines()
+                   if l.strip() and int(l.split(",")[0]) != mine)
+    except Exception:
+        return -1
+
+
 def gpu_tag(device):
     if device.type != "cuda":
         return "cpu"
@@ -109,7 +131,8 @@ def build_from_config(cfg, shape, n_frames, device):
                          base_resolution=list(e.resolutions[0]),
                          per_level_scale=list(e.per_level_scale),
                          max_resolution=list(e.resolutions[-1]),
-                         interpolation=e.interpolation).to(device)
+                         interpolation=e.interpolation,
+                         replicate=int(enc.get("replicate", 64))).to(device)
         assert w.n_entries == e.n_entries and w.resolutions == e.resolutions, (
             "the warp ladder does not match the default one")
         with torch.no_grad():
@@ -117,7 +140,46 @@ def build_from_config(cfg, shape, n_frames, device):
         model.encoding = w
     elif impl != "default":
         raise SystemExit(f"unknown encoder.implementation {impl!r}")
+
+    # THE DECODER, on its own axis. It was 10-12% of the step while the encoder
+    # took 88%, and was rightly ignored; once the kernel has cut the encoder to
+    # a few ms the same 64x64x2 MLP is a third of what is left, and the launch
+    # overhead of its six small kernels starts to show. Separate from the
+    # encoder's knobs because the two are now optimised for different reasons:
+    # the encoder moves 32 M table rows, the decoder moves almost nothing and
+    # pays for the trip.
+    dec = enc.get("decoder", {})
+    dimpl = str(dec.get("implementation", "default"))
+    if dimpl == "compile":
+        object.__setattr__(model, "mlp", torch.compile(model.mlp, dynamic=False))
+    elif dimpl != "default":
+        raise SystemExit(f"unknown encoder.decoder.implementation {dimpl!r}")
+    dprec = str(dec.get("precision", "fp32"))
+    if dprec in ("bf16", "fp16"):
+        model.mlp = _HalfMLP(model.mlp, torch.bfloat16 if dprec == "bf16"
+                             else torch.float16)
+    elif dprec != "fp32":
+        raise SystemExit(f"unknown encoder.decoder.precision {dprec!r}")
     return model, p
+
+
+class _HalfMLP(torch.nn.Module):
+    """Run the MLP in half and hand fp32 back to the loss.
+
+    A Module rather than a closure because the optimiser splits the parameters
+    by asking `model.mlp.parameters()`, and a plain function has none.  The
+    weights stay fp32 masters -- only the matmuls are cast -- so Adam's
+    arithmetic is unchanged and the gradient reaching the encoder arrives in the
+    precision its kernel expects.
+    """
+
+    def __init__(self, inner, dt):
+        super().__init__()
+        self.inner, self.dt = inner, dt
+
+    def forward(self, f):
+        with torch.autocast("cuda", dtype=self.dt):
+            return self.inner(f).float()
 
 
 def _wrap_half_encoder(enc):
@@ -134,6 +196,39 @@ def _wrap_half_encoder(enc):
         return inner(x.to(dt)).float()
 
     enc.forward = forward
+
+
+class SplitOpt:
+    """Torch's Adam for the decoder, a fused kernel for the table.
+
+    Two parameter groups with nothing in common: 6,337 decoder weights that
+    every step needs, and 32.5 M table values of which 45.3% get a gradient.
+    One optimiser over both has to treat them the same.
+    """
+
+    def __init__(self, model, lr, skip_zero=True):
+        from ngp.hashgrid_warp import TableAdam
+        table = model.encoding.table
+        rest = [q for q in model.parameters() if q is not table]
+        self.small = torch.optim.Adam(rest, lr=lr)
+        self.big = TableAdam(table, lr=lr, skip_zero=skip_zero)
+
+    def zero_grad(self, set_to_none=True):
+        self.small.zero_grad(set_to_none=set_to_none)
+        self.big.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        self.small.step()
+        self.big.step()
+
+
+def make_opt(cfg, model, lr):
+    kind = str(cfg.get("training", {}).get("optimizer", "adam"))
+    if kind == "adam":
+        return torch.optim.Adam(model.parameters(), lr=lr)
+    if kind in ("split_adam", "split_adam_dense"):
+        return SplitOpt(model, lr, skip_zero=(kind == "split_adam"))
+    raise SystemExit(f"unknown training.optimizer {kind!r}")
 
 
 def get_data(cfg, device):
@@ -164,7 +259,7 @@ def run_bench(cfg, name, device):
     resident = vol.numel() * vol.element_size()
     model, p = build_from_config(cfg, (h, w), T, device)
     n_enc, n_mlp = model.n_parameters()
-    opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]))
+    opt = make_opt(cfg, model, float(tr["lr"]))
     batch = int(tr["batch"])
 
     print(f"[bench ] {gpu_tag(device)}  {name}  {T} frames of {w}x{h}, "
@@ -235,10 +330,17 @@ def run_bench(cfg, name, device):
     out = {
         "config": name, "gpu": gpu_tag(device),
         "impl": str(cfg["encoder"].get("implementation", "default")),
+        "replicate": int(cfg["encoder"].get("replicate", 64)),
+        "decoder": ("+".join(
+            [v for k, v in (("implementation", "compile"), ("precision", "bf16"),
+                            ("precision", "fp16"))
+             if str(cfg["encoder"].get("decoder", {}).get(k, "")) == v]) or "-"),
         "precision": str(cfg["encoder"].get("precision", "fp32")),
+        "optimizer": str(cfg.get("training", {}).get("optimizer", "adam")),
         "device_name": (torch.cuda.get_device_name(device)
                         if device.type == "cuda" else platform.processor() or "cpu"),
         "torch": torch.__version__, "cuda": torch.version.cuda,
+        "other_procs_mb": other_processes(device),
         "dataset": cfg["dataset"]["field"], "source": src,
         "frames": int(T), "height": int(h), "width": int(w),
         "n_parameters": int(n_enc + n_mlp), "n_table": int(n_enc),
@@ -260,6 +362,9 @@ def run_bench(cfg, name, device):
         "fixed_gb": fixed_gb,
         "when": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if out["other_procs_mb"] > 200:
+        print(f"[warn  ] {out['other_procs_mb']:,} MB on this GPU belongs to other "
+              f"processes -- this row is not a clean measurement", flush=True)
     print(f"[result] {out['gpu']}: {ms:.2f} ms/step, "
           f"{out['samples_per_s'] / 1e6:.2f} M samples/s, peak "
           f"{out['peak_alloc_gb']:.2f} GB allocated / {out['peak_reserved_gb']:.2f} "
@@ -296,7 +401,7 @@ def run_profile(cfg, name, device, iters=30):
     tr = cfg["training"]
     vol, T, h, w, src = get_data(cfg, device)
     model, p = build_from_config(cfg, (h, w), T, device)
-    opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]))
+    opt = make_opt(cfg, model, float(tr["lr"]))
     batch = int(tr["batch"])
     enc = model.encoding
 
@@ -383,7 +488,7 @@ def run_fit(cfg, name, device):
     tr = cfg["training"]
     vol, T, h, w, src = get_data(cfg, device)
     model, p = build_from_config(cfg, (h, w), T, device)
-    opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]))
+    opt = make_opt(cfg, model, float(tr["lr"]))
     batch, steps = int(tr["batch"]), int(tr["steps"])
     t0 = time.perf_counter()
     for step in range(steps):
@@ -415,11 +520,24 @@ def run_fit(cfg, name, device):
             "when": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
-def run_table(name, log_dir):
-    rows = []
+def run_table(name, log_dir, clean_only=True):
+    """Every bench_*.json in one table.
+
+    CLEAN ROWS ONLY by default: a row measured while another process held memory
+    on the same GPU is not comparable with one that had the card -- the same
+    config read 17.75 ms alone and 35.60 ms beside two other jobs. Cluster jobs
+    get a card to themselves; a workstation shared with a training run does not.
+    """
+    rows, dirty = [], 0
     for f in sorted(os.listdir(log_dir)) if os.path.isdir(log_dir) else []:
         if f.startswith("bench_") and f.endswith(".json"):
-            rows.append(json.load(open(os.path.join(log_dir, f))))
+            r = json.load(open(os.path.join(log_dir, f)))
+            if clean_only and r.get("other_procs_mb", 0) > 200:
+                dirty += 1
+                continue
+            rows.append(r)
+    if dirty:
+        print(f"  ({dirty} row(s) hidden: another process held the GPU)")
     if not rows:
         sys.exit(f"no bench_*.json under {log_dir}")
     rows.sort(key=lambda r: r["ms_per_step"])
@@ -428,12 +546,14 @@ def run_table(name, log_dir):
           f"{rows[0]['width']}x{rows[0]['height']}, "
           f"{rows[0]['n_parameters']:,} parameters, batch {rows[0]['batch']:,}\n")
     steps = rows[0].get("train_steps", 0)
-    print(f"  {'gpu':22s} {'impl':>8s} {'prec':>6s} {'ms/step':>9s} {'M smp/s':>9s} "
+    print(f"  {'gpu':18s} {'impl':>8s} {'prec':>5s} {'opt':>16s} {'ms/step':>9s} {'M smp/s':>9s} "
           f"{f'{steps} steps (min)':>17s} {'peak GB':>9s} {'B/sample':>9s} "
           f"{'vs slowest':>11s}")
     for r in rows:
-        print(f"  {r['device_name'][:22]:22s} {r.get('impl','default'):>8s} "
-              f"{r.get('precision','fp32'):>6s} {r['ms_per_step']:9.2f} "
+        print(f"  {r['device_name'][:18]:18s} {r.get('impl','default'):>8s} "
+              f"{r.get('precision','fp32'):>5s} {r.get('optimizer','adam'):>16s} "
+              f"{r.get('decoder','-'):>8s} {r.get('replicate',0):>4d} "
+              f"{r['ms_per_step']:9.2f} "
               f"{r['samples_per_s'] / 1e6:9.2f} {r.get('train_minutes', 0):17.1f} "
               f"{r['peak_alloc_gb']:9.2f} {r.get('bytes_per_sample', 0):9.0f} "
               f"{base / r['ms_per_step']:10.2f}x")
@@ -467,6 +587,12 @@ def main():
         suffix = "" if out["impl"] == "default" else f"_{out['impl']}"
         if out["precision"] != "fp32":
             suffix += f"_{out['precision']}"
+        if out["impl"] == "warp" and out["replicate"] != 64:
+            suffix += f"_rep{out['replicate']}"
+        if out["decoder"] != "-":
+            suffix += f"_dec{out['decoder'].replace('+', '')}"
+        if out["optimizer"] != "adam":
+            suffix += f"_{out['optimizer']}"
         f = os.path.join(log_dir, f"bench_{out['gpu']}{suffix}.json")
         json.dump(out, open(f, "w"), indent=1)
         print(f"wrote {f}")

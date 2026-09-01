@@ -146,7 +146,10 @@ def hash_backward(x: wp.array2d(dtype=wp.float32),
                   smooth: wp.array(dtype=wp.int32),
                   gain: wp.array(dtype=wp.float32),
                   ndim: wp.int32,
-                  grad_table: wp.array2d(dtype=wp.float32)):
+                  rep_rows: wp.int32,
+                  rep: wp.int32,
+                  grad_rep: wp.array(dtype=wp.vec2),
+                  grad_table: wp.array(dtype=wp.vec2)):
     """The weights and indices are RECOMPUTED, not read back.
 
     Nothing was stored by the forward, so there is nothing to load: a dozen
@@ -186,8 +189,49 @@ def hash_backward(x: wp.array2d(dtype=wp.float32),
         idx = _corner_index(cc[0], cc[1], cc[2], cc[3],
                             res[l, 0], res[l, 1], res[l, 2], res[l, 3],
                             ndim, dense[l], tsz[l]) + off[l]
-        wp.atomic_add(grad_table, idx, 0, ww * g0)
-        wp.atomic_add(grad_table, idx, 1, ww * g1)
+        # WHERE THE ADD LANDS. A coarse level is a few hundred rows shared by
+        # every sample in the batch: level 0 here is 243 rows taking 8,630 adds
+        # each (16,660 for the busiest), and those adds serialise on one address.
+        # A fine level is the opposite -- level 15 averages 1.3 adds per row and
+        # collides with nobody. So the coarse rows, and only those, are given
+        # `rep` private copies and the thread picks one by its own index; the
+        # copies are summed afterwards. Contention falls by `rep`, the fine
+        # levels keep the direct path, and the arithmetic is unchanged because
+        # addition does not care in what order it is done.
+        if idx < rep_rows:
+            j = (b & (rep - 1)) * rep_rows + idx
+            wp.atomic_add(grad_rep, j, wp.vec2(ww * g0, ww * g1))
+        else:
+            # The two features of a row are adjacent, so the pair is written as
+            # one vec2 add. MEASURED NO FASTER than two scalar adds (4.63 vs
+            # 4.62 ms/step on an H100): warp lowers it to two atomics anyway.
+            # Kept because it reads better, not because it bought anything.
+            # What the 2.57 ms backward is actually made of: 8 corners x 16
+            # levels x 262,144 samples = 33.5 M atomic adds, at roughly the
+            # 26 G ops/s the hardware does them at. Spreading them helps a
+            # little (privatisation below, 5%); issuing fewer would help more,
+            # and nothing here issues fewer.
+            wp.atomic_add(grad_table, idx, wp.vec2(ww * g0, ww * g1))
+
+
+@wp.kernel
+def reduce_rep(grad_rep: wp.array(dtype=wp.vec2),
+               rep_rows: wp.int32,
+               rep: wp.int32,
+               grad_table: wp.array(dtype=wp.vec2)):
+    """Sum the private copies into the real gradient, and clear them.
+
+    One thread per coarse row reads `rep` values with no atomics at all, and
+    zeroes as it goes so the next backward starts clean without a separate
+    memset.
+    """
+    i = wp.tid()
+    s = wp.vec2(0.0, 0.0)
+    for r in range(rep):
+        j = r * rep_rows + i
+        s += grad_rep[j]
+        grad_rep[j] = wp.vec2(0.0, 0.0)
+    grad_table[i] = s
 
 
 class _WarpEncode(torch.autograd.Function):
@@ -211,10 +255,16 @@ class _WarpEncode(torch.autograd.Function):
         gt = None
         if table.requires_grad:
             gt = torch.zeros_like(table)
+            rr, rep = meta["rep_rows"], meta["rep"]
             wp.launch(hash_backward, dim=(x.shape[0], meta["n_levels"]), inputs=[
                 wp.from_torch(x.contiguous()), wp.from_torch(grad_out.contiguous()),
                 meta["res"], meta["off"], meta["tsz"], meta["dense"],
-                meta["smooth"], meta["gain"], meta["ndim"], wp.from_torch(gt)])
+                meta["smooth"], meta["gain"], meta["ndim"], rr, rep,
+                meta["grad_rep"], wp.from_torch(gt, dtype=wp.vec2)])
+            if rr:
+                wp.launch(reduce_rep, dim=rr,
+                          inputs=[meta["grad_rep"], rr, rep,
+                                  wp.from_torch(gt, dtype=wp.vec2)])
         if x.requires_grad:
             raise NotImplementedError(
                 "the warp encoder has no input gradient; the registration pages "
@@ -232,7 +282,8 @@ class WarpHashGrid(nn.Module):
 
     def __init__(self, n_input_dims=2, n_levels=16, n_features_per_level=2,
                  log2_hashmap_size=19, base_resolution=16, per_level_scale=1.5,
-                 max_resolution=None, interpolation="linear", hash_shuffle=True):
+                 max_resolution=None, interpolation="linear", hash_shuffle=True,
+                 replicate=64, replicate_max_rows=1 << 16):
         super().__init__()
         if n_features_per_level != F_FIXED:
             raise ValueError(f"the warp kernel is written for F={F_FIXED}")
@@ -274,6 +325,15 @@ class WarpHashGrid(nn.Module):
         self.register_buffer("level_gain", torch.ones(n_levels), persistent=False)
         self._interp = interp
         self._meta = None
+        # PRIVATISATION OF THE COARSE ROWS, see hash_backward. `replicate` is
+        # how many private copies each such row gets (a power of two, 0 turns
+        # the whole thing off); `replicate_max_rows` decides which levels count
+        # as coarse -- a level small enough that the batch keeps hitting the
+        # same rows.
+        self.replicate = int(replicate)
+        self.replicate_max_rows = int(replicate_max_rows)
+        if self.replicate and (self.replicate & (self.replicate - 1)):
+            raise ValueError("replicate must be a power of two")
 
     def _build_meta(self, device):
         r = np.zeros((self.n_levels, 4), np.int32)
@@ -286,7 +346,23 @@ class WarpHashGrid(nn.Module):
                          else self.n_entries) - self.level_offsets[l]
                         for l in range(self.n_levels)], np.int32)
         dev = wp.device_from_torch(device)
+        # The coarse levels form a prefix of the table, so "the replicated rows"
+        # is a single bound rather than a mask: everything below rep_rows is
+        # private, everything above is direct.
+        rep_rows = 0
+        for l in range(self.n_levels):
+            if int(tsz[l]) > self.replicate_max_rows:
+                break
+            rep_rows = self.level_offsets[l] + int(tsz[l])
+        rep = self.replicate if rep_rows else 0
+        while rep > 1 and rep * rep_rows * 2 * 4 > 64 << 20:   # 64 MB ceiling
+            rep //= 2
+        if rep <= 1:
+            rep, rep_rows = 1, 0
         return {
+            "rep": rep, "rep_rows": rep_rows,
+            "grad_rep": wp.zeros(shape=(max(rep * rep_rows, 1),),
+                                 dtype=wp.vec2, device=dev),
             "n_levels": self.n_levels, "ndim": self.n_input_dims,
             "res": wp.array(r, dtype=wp.int32, device=dev, ndim=2),
             "off": wp.array(np.array(self.level_offsets, np.int32), dtype=wp.int32,
@@ -318,3 +394,79 @@ class WarpHashGrid(nn.Module):
         return (f"warp, D={self.n_input_dims}, L={self.n_levels}, F={F_FIXED}, "
                 f"{n_hash}/{self.n_levels} levels hashed, "
                 f"{self.n_entries * F_FIXED / 1e6:.2f}M table params")
+
+
+# ----------------------------------------------------------------- the update
+
+
+@wp.kernel
+def adam_table(p: wp.array2d(dtype=wp.float32),
+               g: wp.array2d(dtype=wp.float32),
+               m: wp.array2d(dtype=wp.float32),
+               v: wp.array2d(dtype=wp.float32),
+               lr: wp.float32, b1: wp.float32, b2: wp.float32, eps: wp.float32,
+               c1: wp.float32, c2: wp.float32, skip_zero: wp.int32):
+    """Adam over the table, skipping rows this step never touched.
+
+    Measured reason: at batch 262,144 the backward writes into 7.37 M of the
+    table's 16.28 M rows -- 45.3% -- and torch's Adam updates all of them, which
+    is six streams of traffic over the whole table to move a little under half
+    of it.  A row with no gradient has m and v decayed by b1 and b2 and p moved
+    by a bias-corrected zero; skipping it is not an approximation of the update,
+    it is the update, minus the arithmetic that a decayed zero contributes.
+
+    NOT exactly torch's Adam on an untouched row: torch still decays m and v
+    there, so a row that is skipped for k steps and then hit again carries a
+    staler moment than torch would.  That is the trade, and it is the same one
+    torch.optim.SparseAdam makes.  `skip_zero=0` runs it dense, which is what
+    the gate compares against.
+    """
+    i = wp.tid()
+    g0 = g[i, 0]
+    g1 = g[i, 1]
+    if skip_zero == 1:
+        if g0 == 0.0 and g1 == 0.0:
+            return
+    m0 = b1 * m[i, 0] + (1.0 - b1) * g0
+    m1 = b1 * m[i, 1] + (1.0 - b1) * g1
+    v0 = b2 * v[i, 0] + (1.0 - b2) * g0 * g0
+    v1 = b2 * v[i, 1] + (1.0 - b2) * g1 * g1
+    m[i, 0] = m0
+    m[i, 1] = m1
+    v[i, 0] = v0
+    v[i, 1] = v1
+    p[i, 0] = p[i, 0] - lr * (m0 / c1) / (wp.sqrt(v0 / c2) + eps)
+    p[i, 1] = p[i, 1] - lr * (m1 / c1) / (wp.sqrt(v1 / c2) + eps)
+
+
+class TableAdam:
+    """Adam for the table alone; the decoder keeps torch's.
+
+    Two parameters with wildly different shapes were sharing one optimiser: 6,337
+    decoder weights that every step needs, and 32.5 M table values of which fewer
+    than half do.  Splitting them lets the big one use a kernel that knows that.
+    """
+
+    def __init__(self, table, lr=1e-2, betas=(0.9, 0.999), eps=1e-8,
+                 skip_zero=True):
+        self.p = table
+        self.lr, (self.b1, self.b2), self.eps = lr, betas, eps
+        self.skip_zero = 1 if skip_zero else 0
+        self.m = torch.zeros_like(table)
+        self.v = torch.zeros_like(table)
+        self.t = 0
+
+    def step(self):
+        if self.p.grad is None:
+            return
+        self.t += 1
+        c1 = 1.0 - self.b1 ** self.t
+        c2 = 1.0 - self.b2 ** self.t
+        wp.launch(adam_table, dim=self.p.shape[0], inputs=[
+            wp.from_torch(self.p.data), wp.from_torch(self.p.grad),
+            wp.from_torch(self.m), wp.from_torch(self.v),
+            float(self.lr), float(self.b1), float(self.b2), float(self.eps),
+            float(c1), float(c2), self.skip_zero])
+
+    def zero_grad(self, set_to_none=True):
+        self.p.grad = None if set_to_none else self.p.grad
