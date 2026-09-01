@@ -106,6 +106,12 @@ def build_from_config(cfg, shape, n_frames, device):
     # bytes it moves is the one change that attacks the same 88% a kernel would.
     # Distinct from autocast, which casts every intermediate and adds traffic --
     # the MPM note measured that going the wrong way.
+    # THE FAST STACK IS THE DEFAULT, since it was measured to change nothing
+    # but the clock: warp kernel + fused table Adam + bf16 decoder matmuls give
+    # 27.09 -> 4.30 ms/step on an H100 at 53.37 dB, the same number the pure
+    # torch path reaches. A config that wants the reference path asks for
+    # `implementation: default` by name -- config/zapbench_bench.yaml does,
+    # because it is the baseline row of the benchmark table.
     prec = str(enc.get("precision", "fp32"))
     if prec in ("bf16", "fp16"):
         dt = torch.bfloat16 if prec == "bf16" else torch.float16
@@ -115,7 +121,7 @@ def build_from_config(cfg, shape, n_frames, device):
     elif prec != "fp32":
         raise SystemExit(f"unknown encoder.precision {prec!r}")
 
-    impl = str(enc.get("implementation", "default"))
+    impl = str(enc.get("implementation", "warp"))
     if impl == "compile":
         model.encoding.forward = torch.compile(model.encoding.forward,
                                                dynamic=False)
@@ -154,7 +160,7 @@ def build_from_config(cfg, shape, n_frames, device):
         object.__setattr__(model, "mlp", torch.compile(model.mlp, dynamic=False))
     elif dimpl != "default":
         raise SystemExit(f"unknown encoder.decoder.implementation {dimpl!r}")
-    dprec = str(dec.get("precision", "fp32"))
+    dprec = str(dec.get("precision", "bf16"))
     if dprec in ("bf16", "fp16"):
         model.mlp = _HalfMLP(model.mlp, torch.bfloat16 if dprec == "bf16"
                              else torch.float16)
@@ -223,7 +229,9 @@ class SplitOpt:
 
 
 def make_opt(cfg, model, lr):
-    kind = str(cfg.get("training", {}).get("optimizer", "adam"))
+    # split_adam by DEFAULT: measured identical quality (53.37 dB either way)
+    # and 10% off the step, so there is no reason for a config to have to ask.
+    kind = str(cfg.get("training", {}).get("optimizer", "split_adam"))
     if kind == "adam":
         return torch.optim.Adam(model.parameters(), lr=lr)
     if kind in ("split_adam", "split_adam_dense"):
@@ -329,14 +337,14 @@ def run_bench(cfg, name, device):
     fixed_gb = (sweep[-1]["peak_alloc_gb"] - per_sample * batch / 1e9) if sweep else 0.0
     out = {
         "config": name, "gpu": gpu_tag(device),
-        "impl": str(cfg["encoder"].get("implementation", "default")),
+        "impl": str(cfg["encoder"].get("implementation", "warp")),
         "replicate": int(cfg["encoder"].get("replicate", 64)),
         "decoder": ("+".join(
             [v for k, v in (("implementation", "compile"), ("precision", "bf16"),
                             ("precision", "fp16"))
              if str(cfg["encoder"].get("decoder", {}).get(k, "")) == v]) or "-"),
         "precision": str(cfg["encoder"].get("precision", "fp32")),
-        "optimizer": str(cfg.get("training", {}).get("optimizer", "adam")),
+        "optimizer": str(cfg.get("training", {}).get("optimizer", "split_adam")),
         "device_name": (torch.cuda.get_device_name(device)
                         if device.type == "cuda" else platform.processor() or "cpu"),
         "torch": torch.__version__, "cuda": torch.version.cuda,

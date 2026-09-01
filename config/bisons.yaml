@@ -1,10 +1,9 @@
-name: zapbench_bench
+name: bisons
 
 dataset:
-  field: zapbench consecutive
+  field: bisons
   downsample: 1
   glob:
-    - /workspace/Plexus/prototype/graphcast/log/*/field.zarr
     - data/*/field.zarr
 
 encoder:
@@ -15,15 +14,12 @@ encoder:
   px_per_finest_cell: 2
   frames_per_finest_cell: 2
   interpolation: [smoothstep, smoothstep, linear]
-  implementation: default
   decoder:
     n_neurons: 64
     n_hidden_layers: 2
     activation: gelu
-    precision: fp32
 
 training:
-  optimizer: adam
   lr: 1.0e-2
   steps: 1500
   batch: 262144
