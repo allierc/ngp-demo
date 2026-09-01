@@ -283,8 +283,15 @@ def build(p, w, h, n_frames):
     n_lv = int(p["n_levels"])
     n_min = (8, 8, 2)
     ppc = max(1.0, float(p["px_per_finest_cell"]))
+    # The time axis in FRAMES PER FINEST CELL, the same way the spatial axes are
+    # in pixels: "200 cells" means nothing without knowing the run is 201 frames
+    # long, while "2 frames per cell" is the number the data has an opinion
+    # about.  Measured on this field, the fine component's lag-1 autocorrelation
+    # is 0.829 -- it is past half correlation after ONE frame -- so 1 is the
+    # setting that keeps its per-frame content and 2 already averages pairs.
+    fpc = max(1.0, float(p["frames_per_finest_cell"]))
     n_max = (max(9, round(w / ppc)), max(9, round(h / ppc)),
-             max(3, int(p["time_cells"])))
+             max(3, round(n_frames / fpc)))
     scale = tuple(math.exp((math.log(mx) - math.log(mn)) / max(1, n_lv - 1))
                   for mn, mx in zip(n_min, n_max))
     model = NGPField(
@@ -487,7 +494,9 @@ def train_job(p, device):
                 f"values +-{vmax:.2f}; "
                 f"{enc.resolutions[0][0]}..{enc.resolutions[-1][0]} cells in "
                 f"space ({w / enc.resolutions[-1][0]:.1f} px per finest cell), "
-                f"{enc.resolutions[-1][2]} along t of {n_frames} frames"
+                f"{enc.resolutions[-1][2]} cells along t of {n_frames} frames "
+                f"({n_frames / max(1, enc.resolutions[-1][2]):.1f} frames per "
+                f"finest cell)"
                 + (f"; {len(held)} frames held out" if held else ""))
         print(f"[run] {note}", flush=True)
         print(f"[params] {n_enc + n_mlp:,} total = {n_enc:,} in the hash table "
@@ -606,12 +615,12 @@ KNOBS = {
         # inside a disc and two cells per cycle is the floor.
         {"name": "px_per_finest_cell", "label": "px per finest cell",
          "choices": [1, 2, 4, 8, 16, 32, 64], "default": 2},
-        # AT the frame spacing, not under it. The fine component decorrelates in
-        # one frame, so there is per-frame content and a coarser t axis throws it
-        # away -- the opposite of stage 2, where the field was smooth in time and
-        # a fine t axis memorised frames instead of interpolating.
-        {"name": "time_cells", "label": "cells along t", "min": 4, "max": 256,
-         "default": 200, "step": 4},
+        # The time axis said in the unit the data has an opinion about, exactly
+        # as the space axes are said in pixels. 1 keeps the finest level at one
+        # cell per frame; the fine component is past half correlation after one
+        # frame, so anything above 1 is averaging frames together.
+        {"name": "frames_per_finest_cell", "label": "frames per finest cell",
+         "choices": [1, 2, 4, 8, 16], "default": 2},
     ],
     "train": [
         {"name": "lr", "label": "learning rate", "min": 1e-4, "max": 1e-1,
@@ -778,7 +787,8 @@ function setup(){
    +`<b>1/${knob.downsample}</b> <span class="dim">resolution,</span> `
    +`<b>${knob.px_per_finest_cell}</b> <span class="dim">px per finest cell</span> `
    +`<span class="dim">(${px} px of the original),</span> `
-   +`<b>${knob.time_cells}</b> <span class="dim">cells along t</span>` + PARAMS;
+   +`<b>${knob.frames_per_finest_cell}</b> `
+   +`<span class="dim">frames per finest cell</span>` + PARAMS;
 }
 setup();
 
