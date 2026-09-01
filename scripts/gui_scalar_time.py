@@ -365,11 +365,15 @@ def level_map_at(model, h, w, t, device, block_px=64, sub=4, thresh=0.08):
     return {"blocks": blocks, "w": w, "h": h, "n_levels": enc.n_levels}
 
 
-MONTAGE_LUT_MAX = 0.10           # what a level adds, signed, on a fixed scale
+# What a level adds, signed. NOT a constant: these datasets run from a +-1 wave to
+# raw counts in the hundreds, and a fixed +-0.1 saturates every tile of the
+# second into one flat red. Set per run from the shown range, like the error
+# panel, and reported in the caption.
+MONTAGE_LUT_FRAC = 0.05
 
 
 @torch.no_grad()
-def level_montage(model, h, w, t, device, side=110, cols=4):
+def level_montage(model, h, w, t, device, vmax, side=110, cols=4):
     """The 16 levels at one time slice, as one 4x4 picture.
 
     The block panel beside it asks "which level is finest HERE", and on this
@@ -399,7 +403,7 @@ def level_montage(model, h, w, t, device, side=110, cols=4):
         return cache[key]
 
     levels = list(range(enc.n_levels))[-(cols * cols - 1):]
-    tiles, labels = [], []
+    tiles, labels, raw = [], [], []
     try:
         for j, l in enumerate([levels[0] - 1] + levels):
             r = enc.resolutions[max(0, l)][0]
@@ -412,60 +416,88 @@ def level_montage(model, h, w, t, device, side=110, cols=4):
                 labels.append(f"0..{l}")
             else:
                 d = (upto(l, ny, nx) - upto(l - 1, ny, nx))
-                rgb = signed_rgb(d.cpu().numpy(), MONTAGE_LUT_MAX)
+                raw.append((len(tiles), d.cpu().numpy()))
+                rgb = None
                 labels.append(f"L{l}")
-            if rgb.shape[:2] != (hs, ws):
+            if rgb is not None and rgb.shape[:2] != (hs, ws):
                 rgb = np.asarray(Image.fromarray(rgb).resize((ws, hs), Image.NEAREST))
             tiles.append(rgb)
     finally:
         enc.set_level_window(float(enc.n_levels))
 
-    return _sheet(tiles, labels, cols)
+    return _sheet(*_scale(tiles, labels, raw, vmax, size=(hs, ws)), cols)
 
 
 @torch.no_grad()
-def level_kymograph(model, h, w, n_frames, device, side=110, cols=4):
+def level_kymograph(model, h, w, n_frames, device, vmax, side=110, cols=4):
     """The temporal pendant of the level montage: what each level adds, in TIME.
 
-    One horizontal line through the field -- the row through two of the discs --
-    swept over every frame, so each tile is x across and t down.  The spatial
-    montage answers where a level works; this answers when, and on a field whose
-    two components differ by an order of magnitude in time (lag-1
-    autocorrelation 0.998 against 0.829) that is the other half of the question.
+    TWO SWEEPS, because one line answers only half the question.  The first half
+    of the sheet is a horizontal line through the middle row -- x across, t down
+    -- and the second is a vertical line through the middle column, y across, t
+    down.  A structure that runs along one of them is invisible in that one and
+    obvious in the other, and on a 7-level fit the two blocks fill the 4x4 sheet
+    that the levels alone left half empty.
 
-    A level's own time resolution is printed with it: `resolutions[l][2]` cells
+    A level's own time resolution is in its label: `resolutions[l][2]` cells
     along t, which is how many frames one cell of that level spans.
     """
     enc = model.encoding
     ny = max(16, min(side, n_frames))
     nx = max(16, side)
-    y = torch.full((nx * ny,), 0.5, device=device)
-    xs = pixel_centers(1, nx, device)[:, 0].repeat(ny)
     ts = torch.arange(ny, device=device).float().repeat_interleave(nx) / max(1, ny - 1)
-    xyt = torch.stack([xs, y, ts], dim=1)
+    line = pixel_centers(1, nx, device)[:, 0].repeat(ny)
+    half = torch.full((nx * ny,), 0.5, device=device)
+    sweeps = {"x": torch.stack([line, half, ts], dim=1),
+              "y": torch.stack([half, line, ts], dim=1)}
     cache = {}
 
-    def upto(k):
-        if k not in cache:
+    def upto(k, ax):
+        if (k, ax) not in cache:
             enc.set_level_window(float(max(0, k + 1)) if k >= 0 else 0.0)
-            cache[k] = model(xyt)[:, 0].reshape(ny, nx)
-        return cache[k]
+            cache[(k, ax)] = model(sweeps[ax])[:, 0].reshape(ny, nx)
+        return cache[(k, ax)]
 
-    levels = list(range(enc.n_levels))[-(cols * cols - 1):]
-    tiles, labels = [], []
+    levels = list(range(enc.n_levels))[-(cols * cols // 2 - 1):]
+    tiles, labels, raw = [], [], []
     try:
-        b0 = levels[0] - 1
-        a = upto(b0)
-        v = np.clip(a.cpu().numpy() / max(1e-6, float(a.abs().max())), -1, 1) * .5 + .5
-        tiles.append((matplotlib.colormaps["viridis"](v)[..., :3] * 255).astype(np.uint8))
-        labels.append(f"0..{b0}")
-        for l in levels:
-            d = upto(l) - upto(l - 1)
-            tiles.append(signed_rgb(d.cpu().numpy(), MONTAGE_LUT_MAX))
-            labels.append(f"L{l} / {enc.resolutions[l][2]}t")
+        for ax in ("x", "y"):
+            b0 = levels[0] - 1
+            a = upto(b0, ax)
+            v = np.clip(a.cpu().numpy() / max(1e-6, float(a.abs().max())), -1, 1) * .5 + .5
+            tiles.append((matplotlib.colormaps["viridis"](v)[..., :3] * 255).astype(np.uint8))
+            labels.append(f"0..{b0} {ax}")
+            for l in levels:
+                d = upto(l, ax) - upto(l - 1, ax)
+                raw.append((len(tiles), d.cpu().numpy()))
+                tiles.append(None)
+                labels.append(f"L{l}/{enc.resolutions[l][2]}t {ax}")
     finally:
         enc.set_level_window(float(enc.n_levels))
-    return _sheet(tiles, labels, cols)
+    return _sheet(*_scale(tiles, labels, raw, vmax), cols)
+
+
+def _scale(tiles, labels, raw, hint, size=None):
+    """Colour the difference tiles on a scale taken from the differences.
+
+    A fraction of the FIELD's range is the wrong scale for them: on the zapbench
+    plane the field runs to 1235 counts and a level's contribution to hundreds,
+    so 5% of the field saturated every tile into one flat red.  The 99th
+    percentile of |difference| over the whole sheet puts the scale where the
+    differences actually are, and it is written onto the first tile so the sheet
+    carries its own units.
+    """
+    if raw:
+        allv = np.concatenate([d.ravel() for _, d in raw])
+        vmax = float(np.percentile(np.abs(allv), 99)) or abs(hint) or 1e-3
+        for i, d in raw:
+            rgb = signed_rgb(d, vmax)
+            if size is not None and rgb.shape[:2] != tuple(size):
+                rgb = np.asarray(Image.fromarray(rgb).resize(
+                    (size[1], size[0]), Image.NEAREST))
+            tiles[i] = rgb
+        labels[0] = f"{labels[0]}  +-{vmax:.3g}"
+    return tiles, labels
 
 
 def _sheet(tiles, labels, cols=4, gap=2):
@@ -580,8 +612,10 @@ def train_job(p, device):
                         lv[str(i)] = level_map_at(model, h, w,
                                                   fr / max(1, n_frames - 1), device)
                     imgs["montage"] = level_montage(
-                        model, h, w, picks[1] / max(1, n_frames - 1), device)
-                    imgs["kymo"] = level_kymograph(model, h, w, n_frames, device)
+                        model, h, w, picks[1] / max(1, n_frames - 1), device,
+                        err_max)
+                    imgs["kymo"] = level_kymograph(model, h, w, n_frames,
+                                                   device, err_max)
                     # every frame, on a coarse grid: cheap, and the only way to
                     # see a fit that is good at the ends and lost in between
                     hs, ws = h // 4, w // 4
@@ -723,10 +757,11 @@ same encoder, and the generator writes all three as separate runs &mdash; the
 <div class="row grid3" style="margin-top:8px">
   <div class="panel"><canvas id="c_montage" width="300" height="300"></canvas>
     <div class="cap">what each level adds in SPACE, middle frame &mdash; signed,
-      fixed &plusmn;__MONTMAX__</div></div>
+      fixed at 5% of the shown range</div></div>
   <div class="panel"><canvas id="c_kymo" width="300" height="300"></canvas>
-    <div class="cap">what each level adds in TIME &mdash; x across, t down,
-      through the middle row; the label gives the level's cells along t</div></div>
+    <div class="cap">what each level adds in TIME &mdash; t down; the top half
+      sweeps x through the middle row, the bottom half y through the middle
+      column. The label gives the level's cells along t</div></div>
 </div>
 <div id="levlegend" class="note"></div>
 <div class="row" style="margin-top:14px">
@@ -1036,7 +1071,7 @@ class Handler(BaseHTTPRequestHandler):
                                                    (not k.startswith("u "), k))))
                         .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
                         .replace("__ERRMAX__", f"{ERROR_LUT_MAX:g}")
-                        .replace("__MONTMAX__", f"{MONTAGE_LUT_MAX:g}"))
+)
             return self._send(page, "text/html; charset=utf-8")
         if u.path == "/api/start":
             if JOB["running"]:

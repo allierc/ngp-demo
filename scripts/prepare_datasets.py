@@ -14,7 +14,16 @@ REDOX -- redox/Organoid_Redox_Ratio_Analysis_T200_3D_Every_10_min/
     stack is 14 planes deep, so "the middle plane" is plane 7, and the result is
     (69, 512, 512): a genuinely continuous field, slow in time.
 
-ZAPBENCH -- zebrafish/zapbench/zapbench.zarr
+ZAPBENCH, THE REAL IMAGES -- gs://zapbench-release/volumes/20240930/aligned
+    One z plane of the functional imaging over the whole run, which is what the
+    traces below are a summary OF.  Aligned rather than raw, so what is left to
+    fit is time and xy.  42 GB of uint16 for a single plane, read with
+    tensorstore's concurrency raised: 0.06 s per frame measured.
+
+ZAPBENCH, THE TRACES (--only zapbench-blobs) -- zebrafish/zapbench/zapbench.zarr
+    Superseded by the images above for fitting, and kept only because it is the
+    view of a different store: the curated neurons and their positions rather
+    than the microscope's pixels.
     NOT A VOLUME.  The local store holds traces (7870 frames x 71721 neurons)
     and positions (71721 x 3), and every neuron has its own z -- 61,262 distinct
     values over 21 to 275 um -- so there are no planes to take.  "The middle
@@ -177,12 +186,80 @@ def prepare_zapbench(out_root, n_frames=256, width=256, target_occupancy=0.10,
                      "coverage": cover, "note": note})
 
     start = (n_total - n_frames) // 2
-    cut(np.arange(start, start + n_frames), "zapbench_consecutive",
+    cut(np.arange(start, start + n_frames), "zapbench_blobs_consecutive",
         "256 frames in a row, 0.914 s apart")
     stride = 20
     span = n_frames * stride
     s0 = max(0, (n_total - span) // 2)
-    cut(np.arange(s0, s0 + span, stride)[:n_frames], "zapbench_every20",
+    cut(np.arange(s0, s0 + span, stride)[:n_frames], "zapbench_blobs_every20",
+        f"256 frames at every {stride}th, spanning {span} frames")
+
+
+# ------------------------------------------------- zapbench, the real images
+
+
+ZAPBENCH_GCS = "volumes/20240930/{}/"
+
+
+def prepare_zapbench_plane(out_root, n_frames=256, down=2, which="aligned",
+                           stride=20):
+    """One z plane of the functional imaging itself, over time, straight from GCS.
+
+    The traces-and-positions store is a summary of this; here the target is the
+    microscope's own frames.  Vijay Kumar's advice, followed: take the ALIGNED
+    volume rather than raw, since it is warped onto the flow field and what is
+    left to fit is time and xy; and raise tensorstore's concurrency, because one
+    z plane over the whole run is 2048 x 1328 x 7879 chunks of (512, 512, 1, 1)
+    -- 42 GB of uint16 -- and the reads parallelise.
+
+    Measured with the concurrency set: 0.06 s per frame, so 256 frames land in
+    about twenty seconds.  Stored at half resolution by default; the page's own
+    downsample knob takes it further without another download.
+    """
+    try:
+        import tensorstore as ts
+    except ImportError:
+        print("  zapbench plane needs tensorstore: pip install tensorstore",
+              flush=True)
+        return
+    import torch
+    ctx = ts.Context({"cache_pool": {"total_bytes_limit": 2_000_000_000},
+                      "data_copy_concurrency": {"limit": 32},
+                      "gcs_request_concurrency": {"limit": 64}})
+    a = ts.open({"driver": "zarr3",
+                 "kvstore": {"driver": "gcs", "bucket": "zapbench-release",
+                             "path": ZAPBENCH_GCS.format(which)}},
+                context=ctx, open=True, read=True).result()
+    X, Y, Z, T = a.domain.shape
+    z = Z // 2
+    print(f"zapbench {which}: {a.domain.shape} {a.dtype}, middle plane z = {z}",
+          flush=True)
+
+    def cut(frames, name, note):
+        t0 = time.perf_counter()
+        # Every frame requested at once: tensorstore issues the chunk reads in
+        # parallel, and asking for them one at a time is what makes this slow.
+        futs = [a[:, :, z, int(t)].read() for t in frames]
+        vol = np.stack([f.result() for f in futs]).astype(np.float32)
+        vol = np.transpose(vol, (0, 2, 1))          # XY -> row-major HxW
+        if down > 1:
+            v = torch.from_numpy(vol)[:, None]
+            vol = torch.nn.functional.avg_pool2d(v, down)[:, 0].numpy()
+        print(f"  {name}: {len(frames)} frames [{frames[0]}..{frames[-1]}] "
+              f"of {vol.shape[2]}x{vol.shape[1]}, values "
+              f"{vol.min():.0f}..{vol.max():.0f}, read in "
+              f"{time.perf_counter() - t0:.0f} s", flush=True)
+        write_store(os.path.join(out_root, name), vol,
+                    {"source": f"gs://zapbench-release/{ZAPBENCH_GCS.format(which)}",
+                     "plane": int(z), "downsample": int(down),
+                     "frames": [int(frames[0]), int(frames[-1])], "note": note})
+
+    start = (T - n_frames) // 2
+    cut(np.arange(start, start + n_frames), "zapbench_consecutive",
+        "256 frames in a row of the aligned volume, one z plane")
+    span = n_frames * stride
+    s0 = max(0, (T - span) // 2)
+    cut(np.arange(s0, s0 + span, stride)[:n_frames], f"zapbench_every{stride}",
         f"256 frames at every {stride}th, spanning {span} frames")
 
 
@@ -190,7 +267,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=os.path.join(ROOT, "data"))
-    ap.add_argument("--only", choices=["redox", "zapbench"], default=None)
+    ap.add_argument("--only", choices=["redox", "zapbench", "zapbench-blobs"],
+                    default=None)
+    ap.add_argument("--plane-down", type=int, default=2,
+                    help="spatial downsample of the GCS plane before storing")
     ap.add_argument("--frames", type=int, default=256)
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--blob-px", type=float, default=2.0,
@@ -200,6 +280,12 @@ def main():
     if a.only in (None, "redox"):
         prepare_redox(a.out)
     if a.only in (None, "zapbench"):
+        prepare_zapbench_plane(a.out, a.frames, a.plane_down)
+    # The traces rendered as blobs, which the real images replaced. Kept because
+    # it is the only view of the OTHER store -- the 71,721 curated neurons with
+    # their positions, rather than the microscope's own pixels -- but not built
+    # unless asked for.
+    if a.only == "zapbench-blobs":
         prepare_zapbench(a.out, a.frames, a.width, blob_px=a.blob_px)
     print(f"\nfit them with:\n  python scripts/gui_scalar_time.py "
           f"--zarr-glob '{a.out}/*/field.zarr'")
