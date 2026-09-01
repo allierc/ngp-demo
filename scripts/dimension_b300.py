@@ -1,86 +1,69 @@
 #!/usr/bin/env python
-"""How large an NGP fits on one B300, and how long it would take.
+"""One (x, y, z, t) NGP over the whole of zapbench: what fits on a B300.
 
     python scripts/dimension_b300.py
-    python scripts/dimension_b300.py --card-gb 80 --speedup 1.0     # the H100 it was measured on
+    python scripts/dimension_b300.py --bf16 --levels 24
+    python scripts/dimension_b300.py --card-gb 80 --speedup 1.0   # the H100 it was measured on
 
-Every constant below was MEASURED in this repo rather than assumed, and is
-printed with the number so a stale one is visible:
+The planes are not independent -- z is a spatial axis of one brain, not a batch
+dimension -- so this dimensions a SINGLE four-dimensional fit of
+2048 x 1328 x 72 x 7879 = 1.543 T voxels, 3.086 TB at uint16.
 
-  compression   32,562,829 parameters reproduced 256 x 1024 x 664 = 174.1 M
-                voxels at 53.37 dB -- 5.35 voxels per parameter.  `-o fit
-                zapbench_bench`, H100, 400 steps.
-  throughput    60.92 M samples/s at batch 262,144 on an H100 with the warp
-                stack.  `-o bench zapbench_bench_warp_sadam_bf16dec`.
-  coverage      1500 steps x 262,144 = 393 M samples over 174.1 M voxels, so
-                2.26 samples per voxel to reach that quality.
+MEASURED CONSTANTS, all from this repo, printed beside the answer so a stale one
+is visible:
+
+  compression   32,562,829 parameters reproduced 174.1 M voxels at 53.37 dB --
+                5.35 voxels per parameter.  `-o fit zapbench_bench` on an H100.
+  throughput    60.92 M samples/s at batch 262,144, THREE dimensions.
+                `-o bench zapbench_bench_warp_sadam_bf16dec`.
+  coverage      393 M samples over 174.1 M voxels and 32.6 M parameters: 2.26
+                samples per voxel, or 12.1 samples per parameter.
   activations   734 B per sample marginal, two-point measured in run_bench.
 
-TWO CAVEATS ON THE HOURS, both of which push the same way.  The measured
-throughput came from a 260 MB table, part of which sits in an H100's 50 MB L2;
-the tables below are 13 to 48 GB and every gather is a cold HBM read, so the
-locality that measurement enjoyed is gone.  And the coverage constant was fitted
-at one scale -- 2.26 samples per voxel bought 53.37 dB on 174 M voxels, and a
-volume 120x larger may want more passes, not the same number.  Treat every hour
-below as a floor rather than an estimate.
+FOUR DIMENSIONS COST A FACTOR OF TWO.  A level reads 2^D corners, so 16 instead
+of 8: twice the gather and twice the atomic adds per sample per level, and the
+backward was already 61.5% of the step.  `--corner-cost` derates the measured
+3D throughput by that factor.  The equations are unchanged, and D=4 is now in
+tests/impl_gate.py, which holds it to 3e-11 on the forward and 4e-07 relative on
+the table gradient against the reference encoder.
 
-THE ONE THING NOT MEASURED is the B300 itself, so its step rate is an estimate:
-the kernel is bound by memory traffic and atomic throughput, B300 has roughly
-2.4x an H100's bandwidth, and `--speedup` derates that to 2.0 by default.  Every
-time below scales linearly with it, so a reader who disagrees can divide.
+TWO LIMITS BITE BEFORE THE CARD DOES.
 
-WHY THE VOLUME IS CUT INTO PLANES.  The full aligned zapbench is 2048 x 1328 x
-72 x 7879 = 1.543 T voxels, 3.086 TB at uint16.  At the compression measured
-that is 288 G parameters, which is 3.5 TB of optimiser state -- not a big card,
-a small cluster.  One z plane is 21.4 G voxels and 42.9 GB, which fits on the
-card WITH its model, and the 72 planes are independent fits.  That is the
-dimensioning; the whole-volume row is printed to show what it would cost.
+  * THE INDEX IS INT32.  `_corner_index` returns wp.int32 and the level offset
+    is added in int32, so the table cannot exceed 2^31 = 2.147 G rows, which at
+    F = 2 is 4.29 G parameters and 51.5 GB with Adam -- a fifth of the card.
+    Lifting it is a type change and a recompile, not a redesign, but it has not
+    been done and nothing below pretends otherwise.
+
+  * THE DATA DOES NOT FIT, and cannot.  3.086 TB against 288 GB.  The fit must
+    stream, and HOW it streams decides whether the run is compute-bound or dead:
+    uniformly random (x, y, z, t) means one 512 kB chunk read per sample, while
+    sampling chunk by chunk -- load a window, sample it hard, move on -- costs
+    one pass over the volume per epoch.  Both rates are printed below.
+
+WHAT THIS CANNOT TELL YOU is the quality.  Every parameter count here implies a
+compression far past the one measured point, and PSNR at 359 voxels per
+parameter is not an extrapolation anybody should make from a single measurement
+at 5.35.  The honest next step is a scaling run -- fit 4 planes x 1000 frames,
+then 8 x 2000, at fixed voxels per parameter, and watch what the curve does --
+before committing a card for a day.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 
-# measured, see the docstring
-VOXELS_PER_PARAM = 174_129_152 / 32_562_829      # 5.35 at 53.37 dB
-SAMPLES_PER_VOXEL = 1500 * 262_144 / 174_129_152  # 2.26
+VOXELS_PER_PARAM_MEASURED = 174_129_152 / 32_562_829       # 5.35 at 53.37 dB
+SAMPLES_PER_VOXEL = 1500 * 262_144 / 174_129_152           # 2.26
+SAMPLES_PER_PARAM = 1500 * 262_144 / 32_562_829            # 12.1
 H100_SAMPLES_PER_S = 60.92e6
 ACT_B_PER_SAMPLE = 734
-FIXED_GB = 1.5                                    # allocator floor measured at 1.29-1.48
+FIXED_GB = 1.5
+INT32_ROWS = 2 ** 31
 
 FULL = (2048, 1328, 72, 7879)
-
-
-def dimension(name, voxels, data_b, card_gb, speedup, ratio, table_bytes,
-              batch, hours_cap=None):
-    """Parameters, memory and wall clock for one fit."""
-    params = voxels / ratio
-    # p + Adam's m and v.  The moments stay fp32 whatever the table is: they are
-    # the running statistics and halving them is a convergence experiment, not a
-    # memory optimisation, and it has not been run.
-    model_gb = params * (table_bytes + 8) / 1e9
-    act_gb = batch * ACT_B_PER_SAMPLE / 1e9
-    data_gb = data_b / 1e9
-    total = model_gb + act_gb + data_gb + FIXED_GB
-    samples = voxels * SAMPLES_PER_VOXEL
-    hours = samples / (H100_SAMPLES_PER_S * speedup) / 3600
-    return {
-        "name": name, "voxels": voxels, "params": params, "model_gb": model_gb,
-        "data_gb": data_gb, "total_gb": total, "hours": hours,
-        "fits": total <= card_gb,
-    }
-
-
-def ladder_for(params, n_levels):
-    """log2 of the table size that gives this many parameters at F=2.
-
-    Entries are shared across levels only in the sense that each hashed level
-    gets its own T rows, so params = n_levels * T * 2 once every level is
-    hashed, which it is at this scale.
-    """
-    import math
-    T = params / (n_levels * 2)
-    return math.log2(max(T, 1))
+CHUNK_B = 512 * 512 * 2          # the store's native chunk, (512, 512, 1, 1) uint16
 
 
 def main():
@@ -89,43 +72,69 @@ def main():
     ap.add_argument("--card-gb", type=float, default=288.0)
     ap.add_argument("--speedup", type=float, default=2.0,
                     help="B300 step rate relative to the measured H100")
+    ap.add_argument("--corner-cost", type=float, default=2.0,
+                    help="4D cost over 3D; 2.0 is the corner count 16/8")
     ap.add_argument("--batch", type=int, default=4_194_304)
-    ap.add_argument("--ratios", type=float, nargs="+", default=[5.35, 10.0, 20.0],
+    ap.add_argument("--levels", type=int, default=16)
+    ap.add_argument("--ratios", type=float, nargs="+",
+                    default=[5.35, 50.0, 100.0, 359.0, 1000.0],
                     help="voxels per parameter; 5.35 is the measured 53.37 dB point")
     ap.add_argument("--bf16", action="store_true",
-                    help="hold the table in bf16 (2 B) rather than fp32 (4 B)")
+                    help="hold the table in bf16 (2 B); Adam's moments stay fp32")
+    ap.add_argument("--cache-gb", type=float, default=64.0,
+                    help="volume kept resident as the streaming window")
     a = ap.parse_args()
 
     X, Y, Z, T = FULL
+    voxels = X * Y * Z * T
+    data_b = voxels * 2
     tb = 2 if a.bf16 else 4
-    cuts = [
-        ("one z plane", X * Y * T, X * Y * T * 2),
-        ("4 planes", X * Y * T * 4, X * Y * T * 4 * 2),
-        ("whole volume", X * Y * Z * T, X * Y * Z * T * 2),
-    ]
-    print(f"\n  zapbench aligned: {X} x {Y} x {Z} x {T} = "
-          f"{X * Y * Z * T / 1e12:.3f} T voxels, {X * Y * Z * T * 2 / 1e12:.3f} TB "
-          f"at uint16")
-    print(f"  card {a.card_gb:.0f} GB, batch {a.batch:,}, table in "
-          f"{'bf16' if a.bf16 else 'fp32'}, B300 assumed {a.speedup:.1f}x the "
-          f"measured H100\n")
-    print(f"  {'cut':>13s} {'voxels':>9s} {'vx/param':>9s} {'params':>9s} "
-          f"{'log2 T':>7s} {'model GB':>9s} {'data GB':>8s} {'total GB':>9s} "
-          f"{'hours':>7s} {'fits':>5s}")
-    for name, voxels, data_b in cuts:
-        for ratio in a.ratios:
-            d = dimension(name, voxels, data_b, a.card_gb, a.speedup, ratio, tb,
-                          a.batch)
-            print(f"  {name:>13s} {voxels / 1e9:8.1f}G {ratio:9.2f} "
-                  f"{d['params'] / 1e9:8.2f}G {ladder_for(d['params'], 16):7.1f} "
-                  f"{d['model_gb']:9.1f} {d['data_gb']:8.1f} {d['total_gb']:9.1f} "
-                  f"{d['hours']:7.1f} {'yes' if d['fits'] else 'NO':>5s}")
-        print()
-    print("  hours are a FLOOR: measured throughput came from a 260 MB table that"
-          "\n  partly fits in L2, and these tables are 13-48 GB of cold HBM reads."
-          "\n  hours are for ONE fit at the measured coverage of "
-          f"{SAMPLES_PER_VOXEL:.2f} samples per voxel;")
-    print(f"  the 72 planes are independent, so {Z} cards finish in the time of one.\n")
+    rate = H100_SAMPLES_PER_S * a.speedup / a.corner_cost
+    act_gb = a.batch * ACT_B_PER_SAMPLE / 1e9
+
+    print(f"\n  zapbench aligned: {X} x {Y} x {Z} x {T} = {voxels / 1e12:.3f} T "
+          f"voxels, {data_b / 1e12:.3f} TB at uint16, ONE 4D fit")
+    print(f"  card {a.card_gb:.0f} GB, batch {a.batch:,} ({act_gb:.1f} GB), "
+          f"{a.levels} levels, table in {'bf16' if a.bf16 else 'fp32'}, "
+          f"streaming window {a.cache_gb:.0f} GB")
+    print(f"  step rate {rate / 1e6:.1f} M samples/s = the measured "
+          f"{H100_SAMPLES_PER_S / 1e6:.1f} x {a.speedup:.1f} (B300) / "
+          f"{a.corner_cost:.1f} (16 corners not 8)\n")
+
+    print(f"  {'vx/param':>9s} {'params':>8s} {'log2 T':>7s} {'model GB':>9s} "
+          f"{'total GB':>9s} {'fits':>5s} {'int32':>6s} "
+          f"{'h, 1 pass':>10s} {'h, params':>10s}")
+    for ratio in a.ratios:
+        params = voxels / ratio
+        rows = params / 2
+        model_gb = params * (tb + 8) / 1e9
+        total = model_gb + act_gb + a.cache_gb + FIXED_GB
+        log2t = math.log2(max(rows / a.levels, 1))
+        # TWO CLOCKS, and the larger one is the answer. A fit needs enough
+        # samples to determine its parameters (12.1 each, measured) AND enough
+        # to have looked at the data (one pass = one sample per voxel). At these
+        # compressions the second is far larger, which is the useful fact: the
+        # run is paced by the size of the volume, not the size of the model.
+        h_pass = voxels / rate / 3600
+        h_par = params * SAMPLES_PER_PARAM / rate / 3600
+        print(f"  {ratio:9.1f} {params / 1e9:7.2f}G {log2t:7.1f} {model_gb:9.1f} "
+              f"{total:9.1f} {'yes' if total <= a.card_gb else 'NO':>5s} "
+              f"{'ok' if rows <= INT32_ROWS else 'OVER':>6s} "
+              f"{h_pass:10.1f} {h_par:10.1f}")
+
+    print(f"\n  int32 ceiling: {INT32_ROWS / 1e9:.2f} G rows = "
+          f"{INT32_ROWS * 2 / 1e9:.2f} G parameters = "
+          f"{INT32_ROWS * 2 * (tb + 8) / 1e9:.1f} GB with Adam, "
+          f"{voxels / (INT32_ROWS * 2):.0f} voxels per parameter")
+    rand_gb_s = rate * CHUNK_B / 1e9
+    seq_gb_s = data_b / (voxels / rate) / 1e9
+    print(f"\n  streaming, at {rate / 1e6:.1f} M samples/s:")
+    print(f"    uniformly random (x,y,z,t): one {CHUNK_B / 1e3:.0f} kB chunk per "
+          f"sample = {rand_gb_s / 1e3:,.1f} TB/s of reads -- impossible")
+    print(f"    chunk by chunk, one pass:   {data_b / 1e12:.3f} TB per epoch = "
+          f"{seq_gb_s:.2f} GB/s sustained -- local NVMe, comfortably")
+    print(f"    so the sampler must walk the store, not the coordinate space:")
+    print(f"    load a {a.cache_gb:.0f} GB window, sample it hard, move on.\n")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,15 @@ CASES = [
          base_resolution=(8, 8, 2), per_level_scale=1.5,
          max_resolution=(512, 512, 128),
          interpolation=("smoothstep", "smoothstep", "linear")),
+    # FOUR DIMENSIONS, because a volume that moves is (x, y, z, t) and not a
+    # stack of independent planes. Sixteen corners per level instead of eight,
+    # which is the whole difference: twice the gather, twice the atomics, and
+    # the same equations. Untested until now -- the kernel was written for it
+    # (vec4i, `1 << ndim`) but nothing had asked.
+    dict(n_input_dims=4, n_levels=8, log2_hashmap_size=16,
+         base_resolution=(8, 8, 2, 4), per_level_scale=1.5,
+         max_resolution=(256, 256, 32, 128),
+         interpolation=("smoothstep", "smoothstep", "smoothstep", "linear")),
 ]
 
 
