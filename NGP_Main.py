@@ -106,11 +106,31 @@ def run_bench(cfg, name, device):
     opt = torch.optim.Adam(model.parameters(), lr=float(tr["lr"]))
     batch = int(tr["batch"])
 
+    print(f"[bench ] {gpu_tag(device)}  {name}  {T} frames of {w}x{h}, "
+          f"{n_enc + n_mlp:,} parameters, batch {batch:,}", flush=True)
+
+    def peak_at(bs, iters=6):
+        """Peak allocation for one training step at this batch, data excluded.
+
+        Reserved as well as allocated: reserved is what the allocator holds and
+        therefore what decides whether the next run OOMs, and the two differ by
+        the fragmentation that a large transient causes.  The resident volume is
+        subtracted so what is left is the STEP's own cost, which is the thing a
+        kernel rewrite can change.
+        """
+        if device.type != "cuda":
+            return 0.0, 0.0
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        for _ in range(iters):
+            one_step(model, opt, vol, bs, device, T)
+        torch.cuda.synchronize(device)
+        return (torch.cuda.max_memory_allocated(device) / 1e9,
+                torch.cuda.max_memory_reserved(device) / 1e9)
+
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
         torch.cuda.synchronize(device)
-    print(f"[bench ] {gpu_tag(device)}  {name}  {T} frames of {w}x{h}, "
-          f"{n_enc + n_mlp:,} parameters, batch {batch:,}", flush=True)
 
     for _ in range(int(b["warmup_steps"])):
         one_step(model, opt, vol, batch, device, T)
@@ -132,6 +152,25 @@ def run_bench(cfg, name, device):
 
     ms = statistics.median(reps) * 1e3
     peak = (torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0)
+    reserved = (torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0)
+
+    # THE MARGINAL COST PER SAMPLE, measured two-point rather than divided out of
+    # one number: the step holds a fixed part (the table, Adam's moments, the
+    # resident volume) and a part that scales with the batch (the gather's
+    # intermediates), and only the second is what a batch-size or kernel change
+    # moves.  Same method as the MPM note's bytes-per-particle.
+    sweep = []
+    for bs in sorted({max(4096, batch // 4), max(4096, batch // 2), batch}):
+        a, r = peak_at(bs)
+        sweep.append({"batch": bs, "peak_alloc_gb": a, "peak_reserved_gb": r})
+        print(f"  batch {bs:>9,}: peak {a:6.2f} GB allocated, {r:6.2f} reserved",
+              flush=True)
+    per_sample = 0.0
+    if len(sweep) >= 2:
+        d_gb = sweep[-1]["peak_alloc_gb"] - sweep[0]["peak_alloc_gb"]
+        d_n = sweep[-1]["batch"] - sweep[0]["batch"]
+        per_sample = d_gb * 1e9 / max(1, d_n)
+    fixed_gb = (sweep[-1]["peak_alloc_gb"] - per_sample * batch / 1e9) if sweep else 0.0
     out = {
         "config": name, "gpu": gpu_tag(device),
         "device_name": (torch.cuda.get_device_name(device)
@@ -145,14 +184,28 @@ def run_bench(cfg, name, device):
         "samples_per_s": batch / (ms / 1e3),
         "steps_per_s": 1e3 / ms,
         "peak_alloc_gb": peak / 1e9,
+        "peak_reserved_gb": reserved / 1e9,
         "resident_data_gb": resident / 1e9,
         "model_state_gb": (peak - resident) / 1e9,
+        "memory_sweep": sweep,
+        "bytes_per_sample": per_sample,
+        "fixed_gb": fixed_gb,
         "when": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     print(f"[result] {out['gpu']}: {ms:.2f} ms/step, "
           f"{out['samples_per_s'] / 1e6:.2f} M samples/s, peak "
-          f"{out['peak_alloc_gb']:.2f} GB of which {out['resident_data_gb']:.2f} "
-          f"is the resident volume", flush=True)
+          f"{out['peak_alloc_gb']:.2f} GB allocated / {out['peak_reserved_gb']:.2f} "
+          f"reserved, of which {out['resident_data_gb']:.2f} is the resident volume",
+          flush=True)
+    if per_sample:
+        card = float(cfg.get("benchmark", {}).get("card_gb", 0) or 0)
+        print(f"[memory] {per_sample:.0f} B per sample marginal, {fixed_gb:.2f} GB "
+              f"fixed", flush=True)
+        if card:
+            room = card * 0.9 - fixed_gb
+            print(f"[memory] on a {card:.0f} GB card that leaves room for a batch of "
+                  f"{room * 1e9 / per_sample / 1e6:.1f} M samples at this model size",
+                  flush=True)
     return out
 
 

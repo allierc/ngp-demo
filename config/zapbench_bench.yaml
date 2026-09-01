@@ -32,3 +32,4 @@ benchmark:
   repeats: 3
   eval_every: 0
   amp: false
+  card_gb: 288
