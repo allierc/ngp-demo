@@ -474,7 +474,8 @@ def train_job(p, device):
         if idx != "xor":
             bits.append(idx)
         if int(p.get("n_hidden_layers", 2)) != 2:
-            bits.append(f"{int(p['n_hidden_layers'])}L mlp")
+            nl = int(p["n_hidden_layers"])
+            bits.append("linear" if nl == 0 else f"{nl}L mlp")
         if float(p.get("l1_table", 0)) > 0:
             bits.append(f"L1t {float(p['l1_table']):g}")
         if float(p.get("l1_mlp", 0)) > 0:
@@ -825,7 +826,9 @@ seg("px per finest cell", [1,2,4,8,16,32,64], "px_per_finest_cell");
 seg("downsample", [1,2,4], "downsample");
 // Decoder depth. Two hidden layers is the paper's; one asks whether the ladder
 // is doing the work on its own, three asks whether the decoder was the limit.
-seg("decoder hidden layers", [1,2,3], "n_hidden_layers");
+// 0 is a LINEAR read-out: one matrix from the 2L features to RGB, nothing
+// nonlinear left outside the grid. The cheapest question this page can ask.
+seg("decoder hidden layers", [0,1,2,3], "n_hidden_layers");
 // The one encoder knob that is not in Table 1: how a node becomes a row.
 // xor is the paper's spatial hash; raster leaves the collisions periodic; perm
 // scatters them with a fixed random permutation and no arithmetic structure,

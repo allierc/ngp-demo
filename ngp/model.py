@@ -42,10 +42,23 @@ class NGPField(nn.Module):
         self.encoding = MultiResHashGrid(n_input_dims=n_input_dims, **grid_kwargs)
 
         act = _ACTIVATIONS[activation]
-        layers: list[nn.Module] = [nn.Linear(self.encoding.n_output_dims, n_neurons), act()]
-        for _ in range(n_hidden_layers - 1):
-            layers += [nn.Linear(n_neurons, n_neurons), act()]
-        layers += [nn.Linear(n_neurons, n_output_dims)]
+        # ZERO HIDDEN LAYERS IS A LINEAR READ-OUT, not a one-layer net: a single
+        # Linear from the L*F concatenated features straight to the output, with
+        # no activation between. Worth having as a setting rather than as a bug,
+        # because it is the experiment that asks how much of the fit the GRID is
+        # doing -- everything nonlinear then lives in the interpolation and the
+        # hash, and the decoder can only take a weighted sum of the levels.
+        # Written as its own branch because the loop below builds one hidden
+        # layer whatever it is asked for: `range(0 - 1)` is empty, so 0 and 1
+        # produced the same network.
+        layers: list[nn.Module]
+        if n_hidden_layers <= 0:
+            layers = [nn.Linear(self.encoding.n_output_dims, n_output_dims)]
+        else:
+            layers = [nn.Linear(self.encoding.n_output_dims, n_neurons), act()]
+            for _ in range(n_hidden_layers - 1):
+                layers += [nn.Linear(n_neurons, n_neurons), act()]
+            layers += [nn.Linear(n_neurons, n_output_dims)]
         if output_activation == "sigmoid":
             layers += [nn.Sigmoid()]
         elif output_activation != "none":

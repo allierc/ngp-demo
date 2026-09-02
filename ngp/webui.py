@@ -510,10 +510,13 @@ throws the shuffle away and indexes by raster number modulo T, so the collisions
 repeat on a fixed stride and line up level after level. <i>random perm</i> scatters
 them with a fixed random permutation and no arithmetic structure at all &mdash; it
 separates "the primes scatter the collisions" from "the primes are primes".</li>
-<li><b>decoder hidden layers</b> &mdash; 1, 2 or 3, 64 wide. Two is the paper's. One
-asks whether the ladder is carrying the fit on its own; three asks whether the
-decoder was ever the limit. It is 6,337 weights against 10^5 or more in the table,
-so it is cheap to change and usually not where the answer is.</li>
+<li><b>decoder hidden layers</b> &mdash; 0, 1, 2 or 3, 64 wide. Two is the paper's;
+three asks whether the decoder was ever the limit. <b>0 is a linear read-out</b>
+&mdash; one matrix from the <code>2L</code> features straight to RGB, 111 weights
+against 6,723 for two layers &mdash; and it is the sharpest question on the page:
+with no nonlinearity outside the grid, whatever the fit still manages is what the
+INTERPOLATION and the HASH are doing on their own. The levels can then only be
+summed with fixed weights, never combined.</li>
 <li><b>L1 shrink, hash table</b> and <b>L1 shrink, decoder</b> &mdash; a proximal L1
 applied after each Adam step: every value is pulled toward zero by the amount shown
 and anything smaller becomes exactly zero. Not a penalty added to the loss, which was
