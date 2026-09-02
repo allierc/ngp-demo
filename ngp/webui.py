@@ -341,6 +341,37 @@ discover it &mdash; on a deformation field that gave 34x fewer parameters, lower
 endpoint error and 64x less bending energy.
 (<code>tests/level_specialisation.py</code>)</p>
 
+<h2>What the level decomposition is</h2>
+<p>The encoder is a sum, so it can be taken apart. Every query concatenates
+<code>L</code> feature pairs into one <code>L*F</code> vector, and the page holds a
+gain vector <code>g</code> of length <code>L</code> that multiplies each level's
+pair before the decoder sees it. Setting <code>g</code> to a 0/1 mask evaluates the
+same trained model with some levels switched off, at no cost and without retraining
+&mdash; that is the whole mechanism behind every level panel here.</p>
+<p>Two masks give two different pictures, and confusing them is easy:</p>
+<ul>
+<li><b>levels 0..k</b> &mdash; the fit you would have with a shorter ladder. Coarse
+to fine, it fills in.</li>
+<li><b>what level k adds</b> &mdash; the difference between <i>0..k</i> and
+<i>0..k-1</i>. This is what the tiles show by default, and it is signed: blue is a
+correction downwards, red upwards, black no change.</li>
+</ul>
+<p><b>The first tile is not black and should not be.</b> Handed an all-zero feature
+vector the decoder does not return zero, it returns whatever its biases decode to
+&mdash; a mid grey. So the baseline every difference is measured from is that grey,
+and the early levels spend themselves correcting the dark background downwards.</p>
+<p>Each tile is sampled on <i>its own</i> level's grid, one sample per node, then
+enlarged with nearest-neighbour. A level with ten cells across the picture therefore
+reads as ten blocks, not as a smooth blur that the display invented.</p>
+<p><b>What it does not show is a frequency band.</b> Every level is queried
+everywhere and a fine level represents a smooth function perfectly well by varying
+its entries slowly, so the tiles are not a wavelet decomposition and the fine ones
+are not edge maps. What they do show is <i>where</i> a level spends itself: on the
+synthetic sources on this page the difference is visible directly &mdash; a
+band-limited wave leaves the levels below its finest wavelength with almost nothing
+to add, while a phase field with sharp walls keeps every level busy along the
+walls.</p>
+
 <h2>Measured here, not assumed</h2>
 <ul>
 <li>Autograd through this pure-PyTorch encoder matches float64 finite differences to
@@ -348,9 +379,20 @@ endpoint error and 64x less bending energy.
 <li>With linear interpolation the Laplacian of a fit scores relative L2 of 1.011
 against analytic truth &mdash; exactly what predicting zero scores, because a
 multilinear interpolant's second derivative is identically zero.</li>
-<li>Capping the finest level at the image's pixel count gave <i>both</i> fewer
-parameters and higher PSNR than leaving it uncapped: 5.92M / 40.28 dB against
-7.66M / 39.54 dB.</li>
+<li>Capping the finest level at the image's pixel count costs quality and saves
+parameters: 5.92M / 33.06 dB against 7.66M / 33.96 dB. An earlier version of this
+page claimed the cap was free and better on both counts; that was measured through
+a sampling bug in the reference image &mdash; a missing half-pixel offset &mdash;
+and does not survive its correction.</li>
+<li>The two encoder implementations agree to 3e-11 on the forward pass and 6e-07
+relative on the table gradient, in 2, 3 and 4 dimensions
+(<code>tests/impl_gate.py</code>), so the hand-written kernel that runs these fits
+is measurably the same encoding as the reference one.</li>
+<li>L1 <i>as a penalty in the loss</i> zeroes nothing: at 1e-4 it moved the table's
+mean |w| from 0.153 to 0.142 and left exactly 0% of it at zero, because Adam crosses
+the kink rather than landing on it. As a proximal step it works &mdash; 1e-4 per step
+zeroes 1.0% of the table for free, 1e-3 zeroes 10.8% for 4.4 dB, 1e-2 zeroes 91.0%
+for 8.3 dB.</li>
 </ul>
 """
 
@@ -377,6 +419,28 @@ _TERMINAL = """
 <code>[stopped]</code> with the final numbers. If those lines are there and the page
 is blank, the fault is in the browser and not in the fit; the page also reports its
 own exceptions back to the terminal as <code>[client]</code>.</p>
+"""
+
+_TRAINING_IMAGE = """
+<h2>Training</h2>
+<p>Three knobs, and no schedule: this page runs Adam at a constant learning rate on
+uniformly random coordinates over the whole picture. The registration pages decay the
+rate and sample inside a foreground mask; this one does neither, because a painting
+has no background to skip and the point here is to see what the encoder does rather
+than what a schedule does.</p>
+<ul>
+<li><b>learning rate</b> &mdash; Adam's step, log-spaced. The hash table takes 1e-2
+comfortably.</li>
+<li><b>iterations</b> &mdash; how long. The panels refresh 40 times over the run
+whatever this is.</li>
+<li><b>batch size</b> &mdash; random coordinates per step, drawn uniformly in the unit
+square. Nothing is masked, so every part of the picture costs the same.</li>
+</ul>
+<p>The fit itself runs on the hand-written kernel by default &mdash; a Warp encoder,
+a fused kernel for the table's Adam, and the decoder's matmuls in bf16, together
+6.3x faster than the pure-PyTorch path at the same quality. Choosing <i>raster mod
+T</i> or <i>random perm</i> falls back to the reference encoder, which implements
+those two and is slower.</p>
 """
 
 INTERFACE_IMAGE = """
@@ -417,21 +481,53 @@ any derivative taken through the fit; going up coarsens the fit and is how you s
 real cells in the level panel.</li>
 </ul>
 
-<h2>The one knob that is not in the paper's table</h2>
+<h2>What is being fitted</h2>
+<p>The <b>image</b> control chooses between a photograph and three synthetic fields,
+and the reason for the synthetic ones is that a painting answers only one question.
+It is broadband and unstructured: every level of the ladder has something to do, so
+nothing you change makes a legible difference in the level panels.</p>
 <ul>
-<li><b>hash index</b> &mdash; <i>xor primes</i> is instant-NGP's spatial hash: the
-node's integer coordinates are multiplied by large primes and XORed together, so two
-nodes that share a row are in unrelated places, and the paper's whole argument rests
-on that ("collisions are pseudo-randomly scattered across space, and statistically
-unlikely to occur simultaneously at every level"). <i>raster mod T</i> throws the
-shuffle away and indexes by the node's plain raster number modulo T. The collisions
-then repeat on a fixed stride instead of scattering, and they line up level after
-level. Switch it and watch the error panel.</li>
+<li><b>painting</b> &mdash; the photograph, 904x1069, broadband.</li>
+<li><b>wave</b> &mdash; six plane waves, wavelengths 64 px down to 4 px, strictly
+band-limited. Nothing finer than 4 px exists, so the levels below that have nothing
+to add and the decomposition should show them empty.</li>
+<li><b>kuramoto</b> &mdash; a lattice of phase oscillators run to partial synchrony:
+broad domains with sharp walls between them, plus the wrap discontinuity of a phase.
+The hardest of the four here by 12 dB, and the one where every level stays busy.</li>
+<li><b>wave+kuramoto</b> &mdash; both at once, so one ladder has to serve a
+band-limited signal and a discontinuous one. Whether the levels divide the work is
+exactly what the decomposition answers.</li>
+</ul>
+
+<h2>The knobs that are not in the paper's table</h2>
+<ul>
+<li><b>hash index</b> &mdash; how a node becomes a row, and the only place the paper
+leaves a choice. <i>xor primes</i> is instant-NGP's spatial hash: coordinates times
+large primes, XORed, so two nodes sharing a row are in unrelated places and the
+paper's argument holds ("collisions are pseudo-randomly scattered across space, and
+statistically unlikely to occur simultaneously at every level"). <i>raster mod T</i>
+throws the shuffle away and indexes by raster number modulo T, so the collisions
+repeat on a fixed stride and line up level after level. <i>random perm</i> scatters
+them with a fixed random permutation and no arithmetic structure at all &mdash; it
+separates "the primes scatter the collisions" from "the primes are primes".</li>
+<li><b>decoder hidden layers</b> &mdash; 1, 2 or 3, 64 wide. Two is the paper's. One
+asks whether the ladder is carrying the fit on its own; three asks whether the
+decoder was ever the limit. It is 6,337 weights against 10^5 or more in the table,
+so it is cheap to change and usually not where the answer is.</li>
+<li><b>L1 shrink, hash table</b> and <b>L1 shrink, decoder</b> &mdash; a proximal L1
+applied after each Adam step: every value is pulled toward zero by the amount shown
+and anything smaller becomes exactly zero. Not a penalty added to the loss, which was
+measured to zero nothing at all. The readout in the line above the panels reports how
+much of the table is exactly zero, so the sparsity is visible rather than hoped for:
+1e-4 per step zeroes 1% for free, 1e-3 zeroes 11% for 4.4 dB, 1e-2 zeroes 91% for
+8.3 dB. The two act on different things &mdash; in the table sparsity is unused
+capacity, in the decoder it is unused levels, since those weights are what reads the
+2L features.</li>
 <li><b>downsample</b> &mdash; 1, 2 or 4. It changes the reference the compression
 figure is measured against, so the same encoder reads four times larger at
 downsample 2.</li>
 </ul>
-""" + _TRAINING + """
+""" + _TRAINING_IMAGE + """
 <h2>Reading the panels</h2>
 <ul>
 <li><b>reference / fit / absolute error</b> &mdash; error on a fixed 0-0.1 scale, so
@@ -536,7 +632,7 @@ multiplied by. Set it above the largest displacement you expect.</li>
 <li><b>overlay grid spacing</b> &mdash; cosmetic, the spacing of the warped grid in
 the ground-truth-vs-fit panel.</li>
 </ul>
-""" + _TRAINING + """
+""" + _TRAINING_IMAGE + """
 <h2>Reading the panels</h2>
 <ul>
 <li><b>source / target / warped by the fit</b> &mdash; if the third matches the

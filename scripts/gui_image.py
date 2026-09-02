@@ -63,6 +63,103 @@ LOCK = threading.Lock()
 STOP = threading.Event()
 IMAGES = {}                          # downsample factor -> (tensor, target, coords)
 
+# ---------------------------------------------------------------- the pictures
+# THREE SYNTHETIC FIELDS BESIDE THE PAINTING, because a photograph answers only
+# one question.  A painting is broadband and unstructured: every level of the
+# ladder has something to do, and the fit looks the same whatever you change.
+# These three are the opposite -- each one puts its content at a KNOWN place in
+# the spectrum, so a level that stops helping is visible rather than inferred.
+#
+#   wave       six plane waves, wavelengths 4 to 64 px.  Strictly band-limited:
+#              nothing above the finest wave exists, so levels finer than that
+#              have nothing to fit and their contribution should collapse.
+#   kuramoto   a lattice of phase oscillators, locally coupled, run to partial
+#              synchrony.  Broad domains with sharp walls between them -- the
+#              structure a hash grid is supposed to be good at, and the one a
+#              Fourier basis is bad at.
+#   wave+kuramoto  both at once, so a single fit has to serve a band-limited
+#              signal and a discontinuous one with the same ladder. Whether the
+#              levels split the work is exactly what the decomposition shows.
+
+def _wave_image(h, w, n_waves=6, seed=0):
+    rng = np.random.default_rng(seed)
+    yy, xx = np.meshgrid(np.arange(h, dtype=np.float32),
+                         np.arange(w, dtype=np.float32), indexing="ij")
+    out = np.zeros((h, w), np.float32)
+    for i in range(n_waves):
+        lam = 64.0 / (2 ** (i * 5 / max(1, n_waves - 1)))     # 64 px down to 4 px
+        th = rng.uniform(0, np.pi)
+        k = 2 * np.pi / lam
+        out += np.cos(k * (xx * np.cos(th) + yy * np.sin(th))
+                      + rng.uniform(0, 2 * np.pi)) / (i + 1)
+    out = (out - out.min()) / max(1e-6, float(np.ptp(out)))
+    return out
+
+
+def _kuramoto_image(h, w, steps=400, K=1.6, dt=0.1, seed=0):
+    """Phase of a locally coupled oscillator lattice, run to partial synchrony.
+
+    dtheta_i/dt = omega_i + K * mean over the four neighbours of sin(theta_j -
+    theta_i).  Torch on whatever device is free, because 400 steps of a 512x512
+    lattice is a second on a GPU and a minute on a cpu.
+    """
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    th = (torch.rand(h, w, generator=g) * 2 * np.pi).to(dev)
+    om = (torch.randn(h, w, generator=g) * 0.6).to(dev)
+    for _ in range(steps):
+        s = torch.zeros_like(th)
+        for sh, ax in ((1, 0), (-1, 0), (1, 1), (-1, 1)):
+            s = s + torch.sin(torch.roll(th, sh, ax) - th)
+        th = th + dt * (om + K * s / 4.0)
+    ph = torch.remainder(th, 2 * np.pi) / (2 * np.pi)
+    return ph.cpu().numpy().astype(np.float32)
+
+
+def _rgb(a, b=None, c=None):
+    """One or three planes to an (h, w, 3) float image in 0..1."""
+    if b is None:
+        return np.repeat(a[..., None], 3, axis=2)
+    return np.stack([a, b, c if c is not None else 0.5 * (a + b)], axis=2)
+
+
+SYNTH_SIZE = 512
+SYNTH = {}
+
+
+def synth_image(name, size=SYNTH_SIZE):
+    """The synthetic sources, built once and cached.
+
+    Colour rather than grey so they go through the same three-channel path as
+    the painting: the red plane carries the field, the green a quarter-shifted
+    copy and the blue their mean, which keeps the channels correlated the way a
+    photograph's are instead of handing the decoder three unrelated problems.
+    """
+    if (name, size) in SYNTH:
+        return SYNTH[(name, size)]
+    if name == "wave":
+        a = _wave_image(size, size)
+        b = _wave_image(size, size, seed=1)
+    elif name == "kuramoto":
+        a = _kuramoto_image(size, size)
+        b = _kuramoto_image(size, size, seed=1)
+    elif name == "wave+kuramoto":
+        a = 0.5 * (_wave_image(size, size) + _kuramoto_image(size, size))
+        b = 0.5 * (_wave_image(size, size, seed=1) + _kuramoto_image(size, size, seed=1))
+    else:
+        raise KeyError(name)
+    SYNTH[(name, size)] = _rgb(a.astype(np.float32), b.astype(np.float32))
+    return SYNTH[(name, size)]
+
+
+SOURCES = ["painting", "wave", "kuramoto", "wave+kuramoto"]
+
+
+def source_array(name):
+    """(h, w, 3) float32 in 0..1 for any source, painting or synthetic."""
+    return read_image(DEFAULT_IMAGE) if name == "painting" else synth_image(name)
+
+
 
 def get_image(path, down, device):
     # Keyed by device as well: /api/preview asks for the shape on the CPU, and a
@@ -70,7 +167,7 @@ def get_image(path, down, device):
     key = (path, down, str(device))
     if key in IMAGES:
         return IMAGES[key]
-    ref = read_image(path)
+    ref = source_array(path)
     t = torch.from_numpy(ref).to(device)
     if down > 1:
         t = F.avg_pool2d(t.permute(2, 0, 1)[None], down)[0].permute(1, 2, 0)
@@ -88,7 +185,7 @@ def image_shape(path, down):
     """(h, w, c) after downsampling, without building any tensor."""
     key = (path, down)
     if key not in SHAPES:
-        h, w, c = read_image(path).shape
+        h, w, c = source_array(path).shape
         SHAPES[key] = (h // down, w // down, c)
     return SHAPES[key]
 
@@ -111,13 +208,13 @@ def build(p, shape):
     kwargs = dict(
         n_input_dims=2, n_output_dims=c,
         n_neurons=int(FIXED["n_neurons"]),
-        n_hidden_layers=int(FIXED["n_hidden_layers"]),
+        n_hidden_layers=int(p.get("n_hidden_layers", FIXED["n_hidden_layers"])),
         activation=FIXED["activation"], output_activation="sigmoid",
         n_levels=n_lv, n_features_per_level=int(FIXED["n_features"]),
         log2_hashmap_size=int(p["log2_hashmap_size"]),
         base_resolution=n_min, per_level_scale=scale,
         max_resolution=max_res, interpolation=FIXED["interpolation"],
-        hash_shuffle=str(p["hash_shuffle"]) in ("1", "1.0", "xor primes", "True"))
+        hash_index=str(p.get("hash_index", "xor")))
     model = NGPField(**kwargs)
     enc = model.encoding
     ladder = [{"level": i, "rx": enc.resolutions[i][0], "ry": enc.resolutions[i][1],
@@ -359,17 +456,30 @@ def montage_png(out, cols=4, gap=2, label=True):
 def train_job(p, device):
     try:
         down = max(1, int(p["downsample"]))
-        img, target, coords, shape = get_image(DEFAULT_IMAGE, down, device)
+        img, target, coords, shape = get_image(str(p["source"]), down, device)
         h, w, c = shape
         torch.manual_seed(0)
         model, ladder = build(p, shape)
         model = model.to(device)
         MODEL["model"], MODEL["shape"] = model, shape
         info = describe(model, shape)
-        shuffled = model.encoding.hash_shuffle
-        label = (f"L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
-                 f"{float(p['px_per_finest_cell']):g}px"
-                 + ("" if shuffled else " raster"))
+        # The history label carries only what was changed FROM the defaults,
+        # so a run that moved one knob is one word longer than the baseline and
+        # the legend stays readable when a dozen runs are on the curve.
+        idx = str(p.get("hash_index", "xor"))
+        bits = [f"L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
+                f"{float(p['px_per_finest_cell']):g}px"]
+        if str(p.get("source", "painting")) != "painting":
+            bits.append(str(p["source"]))
+        if idx != "xor":
+            bits.append(idx)
+        if int(p.get("n_hidden_layers", 2)) != 2:
+            bits.append(f"{int(p['n_hidden_layers'])}L mlp")
+        if float(p.get("l1_table", 0)) > 0:
+            bits.append(f"L1t {float(p['l1_table']):g}")
+        if float(p.get("l1_mlp", 0)) > 0:
+            bits.append(f"L1m {float(p['l1_mlp']):g}")
+        label = " ".join(bits)
         print(f"[run] L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
               f"{float(p['px_per_finest_cell']):g} px per finest cell "
               f"(Nmax {model.encoding.resolutions[-1][0]}) "
@@ -400,7 +510,11 @@ def train_job(p, device):
         # own, which is why this is two lines and no flag.
         try:
             from ngp.hashgrid_warp import accelerate, SplitOpt
-            model = accelerate(model, int(p["log2_hashmap_size"]))
+            # The kernel implements the xor hash only, so the other two index
+            # modes stay on the reference encoder. Slower, and the point of
+            # those modes is what they do to the fit, not how fast they do it.
+            model = (accelerate(model, int(p["log2_hashmap_size"]))
+                     if str(p.get("hash_index", "xor")) == "xor" else model)
             opt = (SplitOpt(model, float(p["lr"]))
                    if hasattr(model.encoding, "n_entries")
                    and type(model.encoding).__name__ == "WarpHashGrid"
@@ -410,6 +524,8 @@ def train_job(p, device):
             opt = torch.optim.Adam(model.parameters(), lr=float(p["lr"]))
         steps = int(p["steps"])
         batch = int(p["batch"])
+        l1_t, l1_m = float(p.get("l1_table", 0.0)), float(p.get("l1_mlp", 0.0))
+        mlp_params = [q for q in model.parameters() if q is not model.encoding.table]
         every = max(1, steps // 40)
         ref_t = target(coords).reshape(h, w, c)
         t_train = 0.0
@@ -425,9 +541,31 @@ def train_job(p, device):
                 loss = ((pred - gt) ** 2 / (pred.detach() ** 2 + 1e-2)).mean()
             else:
                 loss = ((pred - gt) ** 2).mean()
+
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
+            # L1 AS A PROXIMAL STEP, not as a term in the loss.  Measured: an
+            # L1 penalty added to the loss and left to Adam moved the table's
+            # mean |w| from 0.153 to 0.142 at 1e-4 and put EXACTLY ZERO rows at
+            # zero, because an adaptive optimiser crosses the kink and bounces
+            # rather than landing on it.  Soft-thresholding after the step is
+            # the same L1 and does land: every value is pulled toward zero by
+            # tau and anything smaller than tau becomes zero and stays there
+            # unless the data pushes it back out.
+            #
+            # The table and the decoder get separate taus because they are not
+            # the same size of thing -- 10^5-10^7 table values against 6,337
+            # decoder weights -- and sparsity means different things in each:
+            # in the table it is unused CAPACITY, in the decoder it is unused
+            # LEVELS, since those weights are what reads the 2L features.
+            if l1_t > 0 or l1_m > 0:
+                with torch.no_grad():
+                    if l1_t > 0:
+                        t = model.encoding.table
+                        t.copy_(t.sign() * (t.abs() - l1_t).clamp_min(0))
+                    for q in (mlp_params if l1_m > 0 else []):
+                        q.copy_(q.sign() * (q.abs() - l1_m).clamp_min(0))
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t_train += time.perf_counter() - t0
@@ -441,7 +579,20 @@ def train_job(p, device):
                     JOB["seconds"] = t_train
                     JOB["curve"].append({"step": step, "t": t_train, "psnr": db,
                                          "loss": loss.detach().item()})
-                    JOB["metrics"] = {**info, "psnr": db, "loss": loss.detach().item()}
+                    # WHAT THE L1 KNOBS DID, or a flat 0% saying they did
+                    # nothing. "Dead" is exactly zero, not merely small: an L1
+                    # penalty is the only thing that drives a row there, so the
+                    # number is 0.0% with the penalty off and rises the moment
+                    # it is on. Sampled rather than counted whole -- 16 M rows
+                    # every 40th step is a memory sweep for a readout.
+                    with torch.no_grad():
+                        tb = model.encoding.table
+                        sub = tb.flatten()[::max(1, tb.numel() // 262144)]
+                        dead = float((sub == 0).float().mean())
+                        mag = float(sub.abs().mean())
+                    JOB["metrics"] = {**info, "psnr": db, "dead_rows": dead,
+                                      "table_l1": mag,
+                                      "loss": loss.detach().item()}
                     JOB["images"]["fit"] = gray_png(fit)
                     JOB["images"]["error"] = cmap_png(err, ERROR_LUT_MAX)
                     JOB["stamp"] += 1
@@ -517,7 +668,14 @@ TRAIN_KNOBS = [
      "max": 1048576, "default": 262144, "step": 4096},
 ]
 DEFAULTS = {k["name"]: k["default"] for k in KNOBS + TRAIN_KNOBS}
-DEFAULTS.update(FIXED, downsample=2, hash_shuffle=1, px_per_finest_cell=1)
+DEFAULTS.update(FIXED, downsample=2, px_per_finest_cell=1)
+# The controls that are segmented buttons rather than sliders live here, since
+# they have no min/max/step to declare.  l1_table and l1_mlp are COEFFICIENTS
+# and not switches: an L1 penalty with no strength attached is not a thing you
+# can turn on, and the interesting question -- how much sparsity costs how much
+# PSNR -- needs at least three points to have an answer.
+DEFAULTS.update(source="painting", hash_index="xor", n_hidden_layers=2,
+                l1_table=0.0, l1_mlp=0.0)
 
 
 PAGE = r"""<!doctype html>
@@ -617,10 +775,31 @@ function noteHTML(m){
        + `<b style="color:${col}">${f.toFixed(1)}%</b> of the `
        + `${m.n_values.toLocaleString()} reference values), `
        + `${m.hashed_levels}/${m.n_levels} levels hashed, `
-       + `${m.finest_px_per_cell.toFixed(2)} px per finest cell</span>`;
+       + `${m.finest_px_per_cell.toFixed(2)} px per finest cell`
+       + (m.dead_rows===undefined ? "" :
+          `, table |w| ${m.table_l1.toExponential(1)}`
+          + (m.dead_rows>0 ? `, <b style="color:#2ea043">`
+             + `${(m.dead_rows*100).toFixed(1)}% of it exactly zero</b>` : ""))
+       + `</span>`;
 }
 
 const C=document.getElementById("controls");
+// seg() when the label IS the value; segv() when it is not -- "1e-6" is a
+// readable label and 0.000001 is not, and the value has to reach the server as
+// a number the loss can multiply by.
+function segv(name, pairs, key, after){
+  const g=document.createElement("div"); g.className="group";
+  const l=document.createElement("div"); l.className="label"; l.textContent=name;
+  const s=document.createElement("div"); s.className="seg";
+  pairs.forEach(([txt,val])=>{
+    const b=document.createElement("button"); b.textContent=txt;
+    b.setAttribute("aria-pressed", knob[key]===val);
+    b.onclick=()=>{ knob[key]=val;
+      [...s.children].forEach(c=>c.setAttribute("aria-pressed", c===b));
+      if(after) after(); preview(); };
+    s.appendChild(b); });
+  g.append(l,s); C.appendChild(g);
+}
 function seg(name, opts, key, after){
   const g=document.createElement("div"); g.className="group";
   const l=document.createElement("div"); l.className="label"; l.textContent=name;
@@ -635,27 +814,35 @@ function seg(name, opts, key, after){
     s.appendChild(b); });
   g.append(l,s); C.appendChild(g);
 }
+// WHAT IS BEING FITTED. A painting is broadband, so every level has something
+// to do and nothing stands out; the three synthetic fields each put their
+// content at a known place in the spectrum, which is what makes the level
+// decomposition readable rather than merely pretty.
+seg("image", ["painting","wave","kuramoto","wave+kuramoto"], "source");
 // N_max as the quantity that means something on a picture: how many pixels one
 // cell of the finest level covers. 1 is the pixel grid itself.
 seg("px per finest cell", [1,2,4,8,16,32,64], "px_per_finest_cell");
 seg("downsample", [1,2,4], "downsample");
-// The one encoder knob that is not in Table 1: whether the index is shuffled at
-// all. Off means the node's raster index modulo T, so the collisions stop being
-// scattered and become periodic.
-(function(){
-  const g=document.createElement("div"); g.className="group";
-  const l=document.createElement("div"); l.className="label";
-  l.textContent="hash index";
-  const sg=document.createElement("div"); sg.className="seg";
-  [["xor primes",1],["raster mod T",0]].forEach(([txt,val])=>{
-    const b=document.createElement("button"); b.textContent=txt;
-    b.setAttribute("aria-pressed", knob.hash_shuffle===val);
-    b.onclick=()=>{ knob.hash_shuffle=val;
-      [...sg.children].forEach(c=>c.setAttribute("aria-pressed", c===b));
-      preview(); };
-    sg.appendChild(b); });
-  g.append(l,sg); C.appendChild(g);
-})();
+// Decoder depth. Two hidden layers is the paper's; one asks whether the ladder
+// is doing the work on its own, three asks whether the decoder was the limit.
+seg("decoder hidden layers", [1,2,3], "n_hidden_layers");
+// The one encoder knob that is not in Table 1: how a node becomes a row.
+// xor is the paper's spatial hash; raster leaves the collisions periodic; perm
+// scatters them with a fixed random permutation and no arithmetic structure,
+// which separates "the primes scatter" from "the primes are primes".
+segv("hash index", [["xor primes","xor"],["raster mod T","raster"],
+                    ["random perm","perm"]], "hash_index");
+// L1, two of them, on scales that have nothing to do with each other: the table
+// is 10^5-10^7 values and the decoder is 6,337, so one coefficient could not
+// serve both. Off is the default because the paper has neither.
+// The number is the SHRINKAGE PER STEP, which is the quantity that decides
+// whether anything reaches zero: table values sit around 0.15, so 1e-4 a step
+// is a slow squeeze and 1e-2 is a hard one. A penalty coefficient would be the
+// wrong number to show -- it was measured to zero nothing at all.
+segv("L1 shrink, hash table", [["off",0],["1e-4",1e-4],["1e-3",1e-3],["1e-2",1e-2]],
+     "l1_table");
+segv("L1 shrink, decoder", [["off",0],["1e-5",1e-5],["1e-4",1e-4],["1e-3",1e-3]],
+     "l1_mlp");
 // Magnifier mode is a view setting, not a model setting: it must not restart a
 // fit, so it is handled here rather than through the knob object.
 (function(){
@@ -1143,7 +1330,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/preview":
             p = _params(q)
             try:
-                shape = image_shape(DEFAULT_IMAGE, max(1, int(p["downsample"])))
+                shape = image_shape(str(p.get("source", "painting")),
+                                    max(1, int(p["downsample"])))
                 model, ladder = build(p, shape)
                 info = describe(model, shape)
                 note = (f"{info['width']}x{info['height']}, {info['n_total']:,} "

@@ -90,6 +90,7 @@ class MultiResHashGrid(nn.Module):
         max_resolution: int | Sequence[float] | None = None,
         interpolation: str | Sequence[str] = "linear",
         hash_shuffle: bool = True,
+        hash_index: str = "",
     ):
         super().__init__()
         if not 1 <= n_input_dims <= 4:
@@ -106,7 +107,24 @@ class MultiResHashGrid(nn.Module):
         self.n_features_per_level = n_features_per_level
         self.n_output_dims = n_levels * n_features_per_level
         self.interpolation = interpolation
-        self.hash_shuffle = bool(hash_shuffle)
+        # THREE WAYS TO TURN A NODE INTO A ROW, which is the one thing the
+        # paper leaves as a design choice rather than a parameter.
+        #   xor     the paper's spatial hash: coordinates times large primes,
+        #           XORed. Collisions land "pseudo-randomly scattered across
+        #           space", which is what lets a level be smaller than its grid.
+        #   raster  the node's plain raster index modulo T. Same table, same
+        #           number of collisions, but they are PERIODIC: two points a
+        #           fixed stride apart share a row at every fine level at once.
+        #   perm    a fixed random permutation of [0, T) applied to the raster
+        #           index. Scattered like the hash but with no arithmetic
+        #           structure at all -- the control that says whether the primes
+        #           matter for what they are, or only for scattering.
+        self.hash_index = (hash_index or
+                           ("xor" if bool(hash_shuffle) else "raster"))
+        if self.hash_index not in ("xor", "raster", "perm"):
+            raise ValueError(f"hash_index must be xor, raster or perm, "
+                             f"got {self.hash_index!r}")
+        self.hash_shuffle = self.hash_index == "xor"
         self._interp = interp
         self._smooth_dims = [d for d, i in enumerate(interp) if i == "smoothstep"]
 
@@ -176,7 +194,7 @@ class MultiResHashGrid(nn.Module):
             f"res per axis ({rng}), {n_hash}/{self.n_levels} levels hashed, "
             f"{self.n_entries * self.n_features_per_level / 1e6:.2f}M table params, "
             f"interp={'/'.join(self._interp)}, "
-            f"hash={'xor primes' if self.hash_shuffle else 'raster mod T'}"
+            f"hash={self.hash_index}"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -204,7 +222,7 @@ class MultiResHashGrid(nn.Module):
                     w = torch.where(self._smooth_mask, ws, w)
 
             corners = base.long().unsqueeze(1) + self.corner_offsets  # (B, C, D)
-            if is_dense or not self.hash_shuffle:
+            if is_dense or self.hash_index != "xor":
                 # The node's raster index.  On a dense level it addresses the
                 # table 1:1; without the shuffle it is taken modulo T instead,
                 # which is the same indexing with the collisions left periodic.
@@ -213,6 +231,8 @@ class MultiResHashGrid(nn.Module):
                     idx = idx * (res[d] + 1) + corners[..., d]
                 if not is_dense:
                     idx = idx % self._table_size(lvl)
+                    if self.hash_index == "perm":
+                        idx = self._perm(lvl, idx.device)[idx]
             else:
                 idx = _hash(corners, self._table_size(lvl))
 
@@ -235,6 +255,21 @@ class MultiResHashGrid(nn.Module):
             feats.append(out_l)
 
         return torch.cat(feats, dim=-1).reshape(*lead, self.n_output_dims)
+
+    def _perm(self, lvl: int, device) -> torch.Tensor:
+        """A fixed random permutation of this level's rows, built once.
+
+        Seeded by the level so a rerun of the same settings gets the same
+        permutation -- otherwise two runs of "perm" would differ for a reason
+        that has nothing to do with what is being compared.
+        """
+        key = (lvl, str(device))
+        cache = self.__dict__.setdefault("_perm_cache", {})
+        if key not in cache:
+            n = self._table_size(lvl)
+            g = torch.Generator(device="cpu").manual_seed(1234 + lvl)
+            cache[key] = torch.randperm(n, generator=g).to(device)
+        return cache[key]
 
     def _table_size(self, lvl: int) -> int:
         """Capacity of level `lvl`'s slice of the shared table."""
