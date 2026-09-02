@@ -510,8 +510,13 @@ throws the shuffle away and indexes by raster number modulo T, so the collisions
 repeat on a fixed stride and line up level after level. <i>random perm</i> scatters
 them with a fixed random permutation and no arithmetic structure at all &mdash; it
 separates "the primes scatter the collisions" from "the primes are primes".</li>
-<li><b>decoder hidden layers</b> &mdash; 0, 1, 2 or 3, 64 wide. Two is the paper's;
-three asks whether the decoder was ever the limit. <b>0 is a linear read-out</b>
+<li><b>decoder hidden layers</b> &mdash; 0, 1, 2, 3, 5 or 10, 64 wide. Two is the
+paper's; the deep ends show why. On the wave source at 400 steps: linear 27.62 dB,
+one 28.66, two 28.77, three 28.89, five 28.86, <b>ten 23.30</b>. Everything from one
+layer to five is within 0.2 dB, and ten is 5.6 dB WORSE than three &mdash; a plain
+64-wide stack with no residual connections trains badly at that depth, and the fit
+pays for a decoder that was never the bottleneck. Depth is not a capacity knob here;
+it is a way to break a working fit. <b>0 is a linear read-out</b>
 &mdash; one matrix from the <code>2L</code> features straight to RGB, 111 weights
 against 6,723 for two layers &mdash; and it is the sharpest question on the page:
 with no nonlinearity outside the grid, whatever the fit still manages is what the

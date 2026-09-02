@@ -828,7 +828,7 @@ seg("downsample", [1,2,4], "downsample");
 // is doing the work on its own, three asks whether the decoder was the limit.
 // 0 is a LINEAR read-out: one matrix from the 2L features to RGB, nothing
 // nonlinear left outside the grid. The cheapest question this page can ask.
-seg("decoder hidden layers", [0,1,2,3], "n_hidden_layers");
+seg("decoder hidden layers", [0,1,2,3,5,10], "n_hidden_layers");
 // The one encoder knob that is not in Table 1: how a node becomes a row.
 // xor is the paper's spatial hash; raster leaves the collisions periodic; perm
 // scatters them with a fixed random permutation and no arithmetic structure,
