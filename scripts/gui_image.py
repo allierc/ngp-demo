@@ -483,7 +483,7 @@ def train_job(p, device):
         print(f"[run] L{int(p['n_levels'])} T2^{int(p['log2_hashmap_size'])} "
               f"{float(p['px_per_finest_cell']):g} px per finest cell "
               f"(Nmax {model.encoding.resolutions[-1][0]}) "
-              f"b {model.encoding.per_level_scale[0]:.3f} (derived) hash {'xor primes' if shuffled else 'raster mod T'}  "
+              f"b {model.encoding.per_level_scale[0]:.3f} (derived) hash {idx}  "
               f"{int(p['steps'])} steps, lr {float(p['lr']):.1e}, "
               f"batch {int(p['batch']):,}  -> {info['n_total']:,} params "
               f"({info['fraction_of_values']*100:.1f}% of the image)", flush=True)
