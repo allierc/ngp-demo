@@ -60,6 +60,13 @@ from ngp.utils import render                                          # noqa: E4
 import gui_scalar_time as page                                           # noqa: E402
 
 MP4_FPS = page.MP4_FPS
+# An ARROW rather than a colour marks the winners. Colour needs a terminal and
+# survives nothing else: not a log file, not a paste into a note, not a grep.
+# The arrow is emboldened when a terminal is watching and is still an arrow when
+# one is not, and it costs three columns of width that were empty anyway.
+BOLD = "\033[1m" if sys.stdout.isatty() else ""
+RESET = "\033[0m" if sys.stdout.isatty() else ""
+WIN = BOLD + " <-" + RESET
 
 
 def median_stack(vol, k):
@@ -406,27 +413,55 @@ def run_modes(vol, a, device, lo, hi, err_max, tag):
     amp = a.amp if a.amp > 0 else 2.5 * float((vol[1:] - vol[:-1]).std())
     print(f"\n[modes ] clean truth: {tuple(vol.shape)}, values {float(vol.min()):.3g}"
           f" to {float(vol.max()):.3g}; artefact amplitude {amp:.4g}\n")
-    print(f"  {'artefact':>12s} {'method':>12s} {'RMSE vs truth':>14s} "
-          f"{'RMSE on stripes':>16s} {'RMSE where clean':>17s} {'vs doing nothing':>17s}")
+    print(f"  {'artefact':>12s} {'method':>12s} {'RMSE vs truth':>17s} "
+          f"{'RMSE on stripes':>19s} {'RMSE where clean':>20s} "
+          f"{'vs doing nothing':>15s}")
     for mode in a.modes:
         corrupt, hit = corrupt_by(mode, vol, amp)
         base = float((corrupt - vol).pow(2).mean().sqrt())
         clean_n = int((~hit).sum())
-        print(f"  {mode:>12s} {'uncorrected':>12s} {base:14.4f} "
-              f"{float((corrupt - vol)[hit].pow(2).mean().sqrt()):16.4f} "
-              f"{0.0:17.4f} {'':>17s}")
+        print(f"  {mode:>12s} {'uncorrected':>12s} {base:14.4f}    "
+              f"{float((corrupt - vol)[hit].pow(2).mean().sqrt()):16.4f}    "
+              f"{0.0:17.4f}    {'':>14s}")
         recs = [(f"{f} k={k}", (median_stack if f == "median" else mean_stack)(corrupt, k))
                 for f in a.filters for k in a.windows]
         if a.ngp:
             rec, _, _ = ngp_recon(a.ngp, corrupt, device)
             recs.append(("ngp fit", rec))
+        # Printed after all of them are scored, not as they come, because the
+        # winner cannot be marked until the last one has run.
+        scored = []
         for label, rec in recs:
             d = rec - vol
             r = float(d.pow(2).mean().sqrt())
             cl = float(d[~hit].pow(2).mean().sqrt()) if clean_n else float("nan")
-            print(f"  {'':>12s} {label:>12s} {r:14.4f} "
-                  f"{float(d[hit].pow(2).mean().sqrt()):16.4f} {cl:17.4f} "
-                  f"{base / max(r, 1e-9):16.2f}x")
+            scored.append((label, r, float(d[hit].pow(2).mean().sqrt()), cl))
+        # ONE ARROW PER COLUMN, on the best value in it. The three columns are
+        # different questions -- total error, error where the artefact was,
+        # error where it was not -- and they do not have to agree; at
+        # stripe:0.1 the median wins the total while a LONGER window wins on
+        # the stripes alone, and that disagreement is the result. Marked only
+        # if it beat doing nothing: at stripe:0.8 every median is worse than
+        # the untouched data, and pointing at the least bad of them would say
+        # the opposite of what the column means.
+        cols = [[r for _, r, _, _ in scored], [st for _, _, st, _ in scored],
+                [cl for _, _, _, cl in scored]]
+        ref = [base, float((corrupt - vol)[hit].pow(2).mean().sqrt()), None]
+        best = []
+        for c, b in zip(cols, ref):
+            vals = [v for v in c if v == v]                      # drop nan
+            m = min(vals) if vals else None
+            best.append(c.index(m) if m is not None
+                        and (b is None or m < b) else -1)
+        for i, (label, r, st, cl) in enumerate(scored):
+            # The last column is base/r, so its winner is the first column's
+            # winner by construction. Marked anyway: a reader scanning the "did
+            # it help at all" column should not have to look back three columns
+            # to find out which row it belongs to.
+            w = [WIN if i == best[j] else "   " for j in range(3)]
+            w.append(WIN if i == best[0] else "   ")
+            print(f"  {'':>12s} {label:>12s} {r:14.4f}{w[0]} {st:16.4f}{w[1]} "
+                  f"{cl:17.4f}{w[2]} {base / max(r, 1e-9):13.2f}x{w[3]}")
         if not a.no_mp4:
             stamp = time.strftime("%Y%m%d_%H%M%S")
             slug = mode.replace(":", "")
@@ -458,7 +493,9 @@ def run_modes(vol, a, device, lo, hi, err_max, tag):
                            os.path.join(a.out, f"{tag}_{slug}_montage_err_{stamp}.mp4"),
                            lo, hi, em, residual=vol, fps=fps_for(a, vol.shape[0]))
         del corrupt, hit, recs
-    print("\n  the last column is the error of doing nothing divided by the error"
+    print("\n  <- marks the best value in each column, and only when it beat"
+          "\n  doing nothing -- a column no method improves on gets no winner."
+          "\n  the last column is the error of doing nothing divided by the error"
           "\n  of the method: above 1 it helped, below 1 it made the data worse.\n")
 
 
