@@ -80,6 +80,43 @@ Noise with a non-zero mean shifts a least-squares fit by the whole of that mean
 (0.1998).  Neither removes an offset it was not told about.
 
 
+## The same map with a MEAN filter instead
+
+A running mean over the same window, same edge handling, so the only difference
+between the two filter rows is the statistic.  This is the sharper comparison of
+the two: a least-squares fit *estimates a mean*, so wherever the fit beats the
+median, this table says whether it won by being a mean or by being a fit.
+
+| artefact | best mean | best median | ngp fit | winner |
+|---|---|---|---|---|
+| `shot:0.02` sparse impulses | 0.88x (k=3) | **1.24x** (k=3) | 0.75x | median; the mean is worse than nothing |
+| `stripe:0.1` sparse stripes | 1.31x (k=3) | **1.51x** (k=3) | 1.19x | median |
+| `stripe:0.2` | **1.34x** (k=3) | 1.32x (k=3) | 1.27x | mean, by a hair |
+| `stripe:0.5` half the frames | **1.19x** (k=3) | 1.04x (k=3) | 1.18x | mean and fit, level |
+| `stripe:0.8` most frames | **1.06x** (k=3) | 0.98x (k=3) | 1.05x | mean and fit, level |
+| `gauss` dense, symmetric | 1.90x (k=7) | 1.72x (k=7) | **2.07x** | fit |
+| `skew` dense, one-sided | 1.25x (k=7) | **1.46x** (k=7) | 1.27x | median |
+
+THE MEAN AND THE FIT TRACK EACH OTHER, and that is the finding.  On the three
+regimes where the fit beat the median -- stripe 0.5, stripe 0.8 and gauss -- a
+plain box filter beats it too, and by almost exactly the same margin (1.19 vs
+1.18, 1.06 vs 1.05, 1.90 vs 2.07).  So the fit was not winning because it is a
+fit; it was winning because it estimates a mean and the median does not, and on
+those artefacts a mean is the right estimator.  The one place the fit is
+genuinely ahead of both filters is `gauss`, where it has something a box filter
+cannot have: it also averages over SPACE, at whatever scale each level works at.
+
+Where the median wins it beats both -- `shot:0.02` is the clearest, since a
+single bright pixel moves a 3-frame mean by a third of its amplitude and moves
+the median not at all, which is why the mean there is worse than doing nothing
+(0.88x) while the median is the best method in the table.
+
+None of this changes what the fit is FOR.  A filter of either kind returns one
+value per voxel and stores exactly what it was given; the fit stores 5.8 M
+parameters for 2.57 M voxels here and, at the sizes that matter, far fewer than
+the data -- and it answers at any (x, y, t) rather than only on the grid.  The
+denoising comparison is a fair fight the fit does not need to win.
+
 ## The two regimes head to head
 
 One NGP — L=16, T=2^22, 1 px and 2 frames per finest cell, 5.8 M parameters —

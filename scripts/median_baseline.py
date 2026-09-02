@@ -85,6 +85,37 @@ def median_stack(vol, k):
     return out
 
 
+def mean_stack(vol, k):
+    """Running MEAN over time, edges replicated, the same window as the median.
+
+    The other obvious baseline, and the more interesting comparison of the two:
+    a mean is what a least-squares fit estimates, so where the fit beats the
+    median the question is whether the fit is winning by being a mean or by
+    being a fit.  Same edge handling and same k, so the only difference between
+    the two rows is the statistic.
+
+    Cumulative sums rather than a loop: a box filter is two subtractions per
+    output, and unlike the median it has no per-window sort to pay for.
+    """
+    T = vol.shape[0]
+    half = k // 2
+    idx = torch.arange(T, device=vol.device)
+    lo = (idx - half).clamp(0, T - 1)
+    hi = (idx + half).clamp(0, T - 1)
+    c = torch.cumsum(vol.double(), 0)
+    zero = torch.zeros_like(c[:1])
+    c = torch.cat([zero, c], 0)                       # c[i] = sum of vol[:i]
+    # Replicated edges: a window that runs off the end keeps sampling the last
+    # frame, so the count stays k and the two ends are filtered like the middle
+    # rather than being averaged over fewer frames.
+    left = (half - (idx - lo)).clamp_min(0)
+    right = (half - (hi - idx)).clamp_min(0)
+    total = (c[hi + 1] - c[lo]
+             + left[:, None, None] * vol[lo].double()
+             + right[:, None, None] * vol[hi].double())
+    return (total / float(k)).to(vol.dtype)
+
+
 def lag1(resid, sample=200_000, seed=0):
     """Lag-1 correlation of the residual along time, over sampled pixels.
 
@@ -384,7 +415,8 @@ def run_modes(vol, a, device, lo, hi, err_max, tag):
         print(f"  {mode:>12s} {'uncorrected':>12s} {base:14.4f} "
               f"{float((corrupt - vol)[hit].pow(2).mean().sqrt()):16.4f} "
               f"{0.0:17.4f} {'':>17s}")
-        recs = [(f"median k={k}", median_stack(corrupt, k)) for k in a.windows]
+        recs = [(f"{f} k={k}", (median_stack if f == "median" else mean_stack)(corrupt, k))
+                for f in a.filters for k in a.windows]
         if a.ngp:
             rec, _, _ = ngp_recon(a.ngp, corrupt, device)
             recs.append(("ngp fit", rec))
@@ -405,7 +437,7 @@ def run_modes(vol, a, device, lo, hi, err_max, tag):
                 torch.stack([(r - vol).abs().flatten()[::13] for _, r in recs] +
                             [(corrupt - vol).abs().flatten()[::13]]).flatten(), 0.999)))
             names = [l for l, _ in recs]
-            best_med = min([r for r in recs if r[0].startswith("median")],
+            best_med = min([r for r in recs if not r[0].startswith("ngp")],
                            key=lambda r: float((r[1] - vol).pow(2).mean()))
             keep = [("truth", vol), ("corrupted", corrupt), best_med,
                     recs[-1] if a.ngp else recs[0]]
@@ -418,7 +450,7 @@ def run_modes(vol, a, device, lo, hi, err_max, tag):
             # the fit, so the pair the argument is about sits side by side. The
             # two medians go underneath, shortest and longest window, which is
             # the axis along which a median trades artefact for signal.
-            meds = [r for r in recs if r[0].startswith("median")]
+            meds = [r for r in recs if not r[0].startswith("ngp")]
             err = [("corrupted", corrupt), recs[-1] if a.ngp else meds[0],
                    meds[0], meds[-1]]
             write_grid_mp4([v for _, v in err[:4]],
@@ -504,6 +536,9 @@ def main():
     ap.add_argument("--windows", type=int, nargs="+", default=[3, 7, 15])
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default=os.path.join(ROOT, "out"))
+    ap.add_argument("--filters", nargs="+", default=["median"],
+                    choices=["median", "mean"],
+                    help="which running filter to compare against")
     ap.add_argument("--modes", nargs="+", default=None,
                     help="artefact modes to map, e.g. stripe:0.2 shot:0.02 gauss skew")
     ap.add_argument("--inject", action="store_true",
